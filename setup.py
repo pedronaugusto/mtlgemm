@@ -20,7 +20,7 @@ else:
         IS_HIP = True
 
 if not IS_HIP:
-    cc_flag = ["--use_fast_math"]
+    cc_flag = ["--use_fast_math", "-allow-unsupported-compiler"]
 else:
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     cc_flag = [f"--offload-arch={arch}" for arch in archs]
