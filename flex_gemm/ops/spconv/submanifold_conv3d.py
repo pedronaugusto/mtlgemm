@@ -1,4 +1,5 @@
 from typing import *
+import platform
 import torch
 from torch.autograd import Function
 from . import Algorithm
@@ -48,7 +49,7 @@ class SubMConv3dFunction(Function):
         hashmap_keys, hashmap_vals = utils.init_hashmap(shape, int(spconv.HASHMAP_RATIO * coords.shape[0]), coords.device)
 
         if spconv.ALGORITHM in [Algorithm.EXPLICIT_GEMM, Algorithm.IMPLICIT_GEMM, Algorithm.IMPLICIT_GEMM_SPLITK]:
-            if coords.is_cuda:
+            if coords.is_cuda or (platform.system() == 'Darwin'):
                 neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map_cuda(
                     hashmap_keys, hashmap_vals, coords,
                     W, H, D,
@@ -62,7 +63,7 @@ class SubMConv3dFunction(Function):
             })
         
         elif spconv.ALGORITHM in [Algorithm.MASKED_IMPLICIT_GEMM, Algorithm.MASKED_IMPLICIT_GEMM_SPLITK]:
-            if coords.is_cuda:
+            if coords.is_cuda or (platform.system() == 'Darwin'):
                 neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map_cuda(
                     hashmap_keys, hashmap_vals, coords,
                     W, H, D,
@@ -215,7 +216,10 @@ class SubMConv3dFunction(Function):
             if feats.requires_grad:
                 # im2col
                 im2col = torch.zeros((N * V, Co), device=feats.device, dtype=feats.dtype)
-                inv_neighbor_map = torch.flip(neighbor_map, [1])
+                if platform.system() == 'Darwin':
+                    inv_neighbor_map = torch.flip(neighbor_map.to(torch.int32), [1]).to(torch.uint32)
+                else:
+                    inv_neighbor_map = torch.flip(neighbor_map, [1])
                 mask = inv_neighbor_map.view(-1) != 0xffffffff
                 im2col[mask] = grad_output[inv_neighbor_map.view(-1).long()[mask]]
                 im2col = im2col.view(N, V * Co)

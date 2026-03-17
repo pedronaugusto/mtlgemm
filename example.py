@@ -17,7 +17,7 @@ flex_gemm.ops.spconv.set_algorithm(
     flex_gemm.ops.spconv.Algorithm.MASKED_IMPLICIT_GEMM_SPLITK
 )
 
-out_feats, neignbor_cache = sparse_submanifold_conv3d(
+out_feats, neighbor_cache = sparse_submanifold_conv3d(
     feats, coords, shape,
     weight, bias,
 )

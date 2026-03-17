@@ -4,7 +4,7 @@
 [![Triton](https://img.shields.io/badge/Triton-%E2%89%A53.2.0-blue)](https://github.com/openai/triton)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A52.4.0-red)](https://pytorch.org/)
 
-**FlexGEMM** is a high-performance, **Triton-powered GEMM backend** designed for **3D sparse convolutions**. 
+**FlexGEMM** is a high-performance, **Triton-powered GEMM backend** designed for **3D sparse convolutions**. This fork adds a **Metal backend** for native Apple Silicon support.
 
 It implements **Explicit**, **Implicit**, and **Masked Implicit** algorithm variants, featuring optional **Split-K** parallelism for sparse GEMM. FlexGEMM delivers **state-of-the-art performance** for Submanifold Convolution and voxel-based neural networks, consistently outperforming existing solutions.
 

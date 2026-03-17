@@ -5,7 +5,10 @@ import json
 import importlib
 import pkgutil
 import torch
-import triton
+try:
+    import triton
+except ImportError:
+    triton = None
 import time
 import inspect
 from filelock import FileLock
@@ -15,7 +18,9 @@ from .. import (
 )
 
 
-class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
+_AutotunerBase = triton.runtime.Autotuner if triton is not None else object
+
+class TritonPersistentCacheAutotuner(_AutotunerBase):
     def __init__(
         self,
         fn,
@@ -324,9 +329,17 @@ def walk_package(package_name, fn):
             fn(full_module_name)
             
 
+def _get_device_name():
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name()
+    import platform
+    if platform.system() == 'Darwin':
+        return "apple_silicon"
+    return "cpu"
+
 def get_autotune_cache():
     cache = {}
-    device_name = torch.cuda.get_device_name()
+    device_name = _get_device_name()
     if device_name not in cache:
         cache[device_name] = {}
 
@@ -387,7 +400,7 @@ def load_autotune_cache(path_or_cache=None):
     if cache is None:
         return
 
-    device_name = torch.cuda.get_device_name()
+    device_name = _get_device_name()
     if device_name not in cache and "*" not in cache:
         return
     if "*" in cache and device_name not in cache:

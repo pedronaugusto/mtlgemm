@@ -1,10 +1,5 @@
 from tqdm import tqdm
 import torch
-# import spconv.pytorch as spconv
-# import torchsparse
-# import torchsparse.nn
-# import torchsparse.nn.functional
-# import fvdb
 import flex_gemm
 from flex_gemm.ops.spconv import SubMConv3dFunction
 from utils import sphere_coords, calc_err, benchmark_kernel
