@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 #include "config.h"
@@ -6,27 +7,28 @@ using namespace metal;
 // ============================================================================
 // Implicit GEMM for sparse submanifold convolution
 //
-// Fuses neighbor gather with GEMM — never materializes im2col buffer.
+// Uses simdgroup_matrix_multiply_accumulate for hardware-accelerated 8x8 matmul.
 // Three kernels: forward, backward-input, backward-weight.
 //
-// Block sizes: B1=32 (N-tile), B2=32 (channel-tile), BK=32 (K-tile)
-// Per-thread sub-tile: TM=4, TN=4
-// Threads per threadgroup: (32/4) * (32/4) = 64
-// Threadgroup memory: B1*BK + BK*B2 + B1 = 2080 floats = 8320 bytes
+// Block sizes: B1=64 (N-tile), B2=64 (channel-tile), BK=32 (K-tile)
+// 256 threads = 8 SIMD groups, each owns one row of 8x8 sub-tiles
+// Threadgroup memory: B1*BK + BK*B2 + B1 = 64*32+32*64+64 = 4160 floats = 16640 bytes
 // ============================================================================
 
-#define B1 GEMM_BLOCK_N   // 32
-#define B2 GEMM_BLOCK_CO  // 32
+#define B1 GEMM_BLOCK_N   // 64
+#define B2 GEMM_BLOCK_CO  // 64
 #define BK GEMM_BLOCK_K   // 32
-#define TM 4
-#define TN 4
 #define SENTINEL 0xFFFFFFFFu
+
+// Number of 8x8 sub-tiles per dimension
+#define TILES_M (B1 / 8)   // 8
+#define TILES_N (B2 / 8)   // 8
 
 // ============================================================================
 // Forward: output[N, Co] = sum_v input[neighbor[n,v], :] * weight[co, v, :]
 //
 // Grid: (cdiv(N, B1), cdiv(Co, B2))
-// Threadgroup: 64 threads (8x8)
+// Threadgroup: 256 threads (8 SIMD groups)
 // ============================================================================
 
 kernel void spconv_fwd_implicit_gemm(
@@ -42,28 +44,25 @@ kernel void spconv_fwd_implicit_gemm(
     constant uint& has_bias           [[buffer(9)]],
     threadgroup float* smem           [[threadgroup(0)]],
     uint2 gid                         [[threadgroup_position_in_grid]],
-    uint  lid                         [[thread_index_in_threadgroup]]
+    uint  lid                         [[thread_index_in_threadgroup]],
+    uint  simd_id                     [[simdgroup_index_in_threadgroup]],
+    uint  lane_id                     [[thread_index_in_simdgroup]]
 ) {
-    // Tile offsets
     uint n_base  = gid.x * B1;
     uint co_base = gid.y * B2;
 
-    // Thread position within tile
-    uint tx = lid % (B2 / TN);  // 0..7 (column thread)
-    uint ty = lid / (B2 / TN);  // 0..7 (row thread)
+    uint threads = GEMM_THREADS;
 
     // Shared memory layout: smem_a[B1][BK] | smem_b[BK][B2] | smem_nb[B1]
-    threadgroup float* smem_a  = smem;                     // B1 * BK floats
-    threadgroup float* smem_b  = smem + B1 * BK;           // BK * B2 floats
-    threadgroup uint*  smem_nb = (threadgroup uint*)(smem + B1 * BK + BK * B2); // B1 uints
+    threadgroup float* smem_a  = smem;
+    threadgroup float* smem_b  = smem + B1 * BK;
+    threadgroup uint*  smem_nb = (threadgroup uint*)(smem + B1 * BK + BK * B2);
 
-    // Accumulator registers
-    float acc[TM][TN];
-    for (uint i = 0; i < TM; i++)
-        for (uint j = 0; j < TN; j++)
-            acc[i][j] = 0.0f;
-
-    uint threads = GEMM_THREADS;  // 64
+    // Each SIMD group owns one row of 8x8 sub-tiles (TILES_N accumulators)
+    // simd_id selects which row (0..TILES_M-1)
+    simdgroup_matrix<float, 8, 8> acc[TILES_N];
+    for (uint i = 0; i < TILES_N; i++)
+        acc[i] = simdgroup_matrix<float, 8, 8>(0.0f);
 
     // Loop over volume elements
     for (uint v = 0; v < V; v++) {
@@ -82,36 +81,32 @@ kernel void spconv_fwd_implicit_gemm(
                 uint col = i % BK;
                 uint ci_idx = bk + col;
                 uint nb_idx = smem_nb[row];
-                if (nb_idx != SENTINEL && ci_idx < Ci) {
-                    smem_a[row * BK + col] = input[nb_idx * Ci + ci_idx];
-                } else {
-                    smem_a[row * BK + col] = 0.0f;
-                }
+                smem_a[row * BK + col] = (nb_idx != SENTINEL && ci_idx < Ci) ?
+                    input[nb_idx * Ci + ci_idx] : 0.0f;
             }
 
             // Cooperative load: smem_b[BK][B2] = weight[co, v, bk..bk+BK]
             // weight layout: [Co, V, Ci] — weight[co, v, ci] = weight[(co * V + v) * Ci + ci]
             for (uint i = lid; i < BK * B2; i += threads) {
-                uint row = i / B2;  // k index
-                uint col = i % B2;  // co index
+                uint row = i / B2;
+                uint col = i % B2;
                 uint ci_idx = bk + row;
                 uint co_idx = co_base + col;
-                if (ci_idx < Ci && co_idx < Co) {
-                    smem_b[row * B2 + col] = weight[(co_idx * V + v) * Ci + ci_idx];
-                } else {
-                    smem_b[row * B2 + col] = 0.0f;
-                }
+                smem_b[row * B2 + col] = (ci_idx < Ci && co_idx < Co) ?
+                    weight[(co_idx * V + v) * Ci + ci_idx] : 0.0f;
             }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // FMA: acc[tm][tn] += smem_a[row, k] * smem_b[k, col]
-            for (uint k = 0; k < BK; k++) {
-                for (uint tm = 0; tm < TM; tm++) {
-                    float a_val = smem_a[(ty * TM + tm) * BK + k];
-                    for (uint tn = 0; tn < TN; tn++) {
-                        acc[tm][tn] += a_val * smem_b[k * B2 + tx * TN + tn];
-                    }
+            // simdgroup_matrix multiply: each SIMD group does its row of 8x8 tiles
+            simdgroup_matrix<float, 8, 8> a_mat;
+            for (uint k8 = 0; k8 < BK; k8 += 8) {
+                // Load A sub-tile: rows [simd_id*8..simd_id*8+7], cols [k8..k8+7]
+                simdgroup_load(a_mat, smem_a + simd_id * 8 * BK + k8, BK);
+                for (uint tn = 0; tn < TILES_N; tn++) {
+                    simdgroup_matrix<float, 8, 8> b_mat;
+                    simdgroup_load(b_mat, smem_b + k8 * B2 + tn * 8, B2);
+                    simdgroup_multiply_accumulate(acc[tn], a_mat, b_mat, acc[tn]);
                 }
             }
 
@@ -119,14 +114,20 @@ kernel void spconv_fwd_implicit_gemm(
         }
     }
 
-    // Store results + bias
-    for (uint tm = 0; tm < TM; tm++) {
-        uint n = n_base + ty * TM + tm;
-        if (n >= N) continue;
-        for (uint tn = 0; tn < TN; tn++) {
-            uint co = co_base + tx * TN + tn;
-            if (co >= Co) continue;
-            float val = acc[tm][tn];
+    // Store results: write accumulators to shared memory, then global with bounds + bias
+    for (uint tn = 0; tn < TILES_N; tn++) {
+        simdgroup_store(acc[tn], smem_a + simd_id * 8 * B2 + tn * 8, B2);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write from shared memory to global with bounds checking + bias
+    for (uint i = lid; i < B1 * B2; i += threads) {
+        uint row = i / B2;
+        uint col = i % B2;
+        uint n = n_base + row;
+        uint co = co_base + col;
+        if (n < N && co < Co) {
+            float val = smem_a[row * B2 + col];
             if (has_bias) val += bias[co];
             output[n * Co + co] = val;
         }
@@ -139,7 +140,7 @@ kernel void spconv_fwd_implicit_gemm(
 // neighbor_inv[n, v] = neighbor[n, V-1-v]  (flipped)
 //
 // Grid: (cdiv(N, B1), cdiv(Ci, B2))
-// Threadgroup: 64 threads (8x8)
+// Threadgroup: 256 threads (8 SIMD groups)
 // ============================================================================
 
 kernel void spconv_bwd_input_implicit_gemm(
@@ -153,24 +154,22 @@ kernel void spconv_bwd_input_implicit_gemm(
     constant uint& V                  [[buffer(7)]],
     threadgroup float* smem           [[threadgroup(0)]],
     uint2 gid                         [[threadgroup_position_in_grid]],
-    uint  lid                         [[thread_index_in_threadgroup]]
+    uint  lid                         [[thread_index_in_threadgroup]],
+    uint  simd_id                     [[simdgroup_index_in_threadgroup]],
+    uint  lane_id                     [[thread_index_in_simdgroup]]
 ) {
     uint n_base  = gid.x * B1;
     uint ci_base = gid.y * B2;
 
-    uint tx = lid % (B2 / TN);
-    uint ty = lid / (B2 / TN);
+    uint threads = GEMM_THREADS;
 
     threadgroup float* smem_a  = smem;
     threadgroup float* smem_b  = smem + B1 * BK;
     threadgroup uint*  smem_nb = (threadgroup uint*)(smem + B1 * BK + BK * B2);
 
-    float acc[TM][TN];
-    for (uint i = 0; i < TM; i++)
-        for (uint j = 0; j < TN; j++)
-            acc[i][j] = 0.0f;
-
-    uint threads = GEMM_THREADS;
+    simdgroup_matrix<float, 8, 8> acc[TILES_N];
+    for (uint i = 0; i < TILES_N; i++)
+        acc[i] = simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint v = 0; v < V; v++) {
         // Flipped neighbor access: neighbor[n, V-1-v]
@@ -189,36 +188,31 @@ kernel void spconv_bwd_input_implicit_gemm(
                 uint col = i % BK;
                 uint co_idx = bk + col;
                 uint nb_idx = smem_nb[row];
-                if (nb_idx != SENTINEL && co_idx < Co) {
-                    smem_a[row * BK + col] = grad_output[nb_idx * Co + co_idx];
-                } else {
-                    smem_a[row * BK + col] = 0.0f;
-                }
+                smem_a[row * BK + col] = (nb_idx != SENTINEL && co_idx < Co) ?
+                    grad_output[nb_idx * Co + co_idx] : 0.0f;
             }
 
             // smem_b[BK][B2] = weight^T for volume v
-            // weight[co, v, ci] transposed: weight_T[co, ci] = weight[co, v, ci]
             // We want smem_b[k][ci] = weight[bk+k, v, ci_base+ci]
             for (uint i = lid; i < BK * B2; i += threads) {
-                uint row = i / B2;  // k (Co dimension)
-                uint col = i % B2;  // ci dimension
+                uint row = i / B2;
+                uint col = i % B2;
                 uint co_idx = bk + row;
                 uint ci_idx = ci_base + col;
-                if (co_idx < Co && ci_idx < Ci) {
-                    smem_b[row * B2 + col] = weight[(co_idx * V + v) * Ci + ci_idx];
-                } else {
-                    smem_b[row * B2 + col] = 0.0f;
-                }
+                smem_b[row * B2 + col] = (co_idx < Co && ci_idx < Ci) ?
+                    weight[(co_idx * V + v) * Ci + ci_idx] : 0.0f;
             }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint k = 0; k < BK; k++) {
-                for (uint tm = 0; tm < TM; tm++) {
-                    float a_val = smem_a[(ty * TM + tm) * BK + k];
-                    for (uint tn = 0; tn < TN; tn++) {
-                        acc[tm][tn] += a_val * smem_b[k * B2 + tx * TN + tn];
-                    }
+            // simdgroup_matrix multiply
+            simdgroup_matrix<float, 8, 8> a_mat;
+            for (uint k8 = 0; k8 < BK; k8 += 8) {
+                simdgroup_load(a_mat, smem_a + simd_id * 8 * BK + k8, BK);
+                for (uint tn = 0; tn < TILES_N; tn++) {
+                    simdgroup_matrix<float, 8, 8> b_mat;
+                    simdgroup_load(b_mat, smem_b + k8 * B2 + tn * 8, B2);
+                    simdgroup_multiply_accumulate(acc[tn], a_mat, b_mat, acc[tn]);
                 }
             }
 
@@ -226,14 +220,19 @@ kernel void spconv_bwd_input_implicit_gemm(
         }
     }
 
-    // Store grad_input
-    for (uint tm = 0; tm < TM; tm++) {
-        uint n = n_base + ty * TM + tm;
-        if (n >= N) continue;
-        for (uint tn = 0; tn < TN; tn++) {
-            uint ci = ci_base + tx * TN + tn;
-            if (ci >= Ci) continue;
-            grad_input[n * Ci + ci] = acc[tm][tn];
+    // Store results to shared memory then global
+    for (uint tn = 0; tn < TILES_N; tn++) {
+        simdgroup_store(acc[tn], smem_a + simd_id * 8 * B2 + tn * 8, B2);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid; i < B1 * B2; i += threads) {
+        uint row = i / B2;
+        uint col = i % B2;
+        uint n = n_base + row;
+        uint ci = ci_base + col;
+        if (n < N && ci < Ci) {
+            grad_input[n * Ci + ci] = smem_a[row * B2 + col];
         }
     }
 }
@@ -243,7 +242,7 @@ kernel void spconv_bwd_input_implicit_gemm(
 //
 // Grid: (cdiv(Co, B1), cdiv(V * Ci, B2))
 // K dimension = N (iterate over all voxels)
-// Threadgroup: 64 threads (8x8)
+// Threadgroup: 256 threads (8 SIMD groups)
 // ============================================================================
 
 kernel void spconv_bwd_weight_implicit_gemm(
@@ -257,25 +256,23 @@ kernel void spconv_bwd_weight_implicit_gemm(
     constant uint& V                  [[buffer(7)]],
     threadgroup float* smem           [[threadgroup(0)]],
     uint2 gid                         [[threadgroup_position_in_grid]],
-    uint  lid                         [[thread_index_in_threadgroup]]
+    uint  lid                         [[thread_index_in_threadgroup]],
+    uint  simd_id                     [[simdgroup_index_in_threadgroup]],
+    uint  lane_id                     [[thread_index_in_simdgroup]]
 ) {
     uint co_base = gid.x * B1;
     uint vci_base = gid.y * B2;  // flat index into V*Ci
 
-    uint tx = lid % (B2 / TN);
-    uint ty = lid / (B2 / TN);
+    uint threads = GEMM_THREADS;
+    uint VCi = V * Ci;
 
     // Shared memory: smem_a[B1][BK] for grad_output, smem_b[BK][B2] for input via neighbor
     threadgroup float* smem_a = smem;
     threadgroup float* smem_b = smem + B1 * BK;
 
-    float acc[TM][TN];
-    for (uint i = 0; i < TM; i++)
-        for (uint j = 0; j < TN; j++)
-            acc[i][j] = 0.0f;
-
-    uint threads = GEMM_THREADS;
-    uint VCi = V * Ci;
+    simdgroup_matrix<float, 8, 8> acc[TILES_N];
+    for (uint i = 0; i < TILES_N; i++)
+        acc[i] = simdgroup_matrix<float, 8, 8>(0.0f);
 
     // K dimension = N, iterate in BK-sized blocks
     for (uint bn = 0; bn < N; bn += BK) {
@@ -285,16 +282,12 @@ kernel void spconv_bwd_weight_implicit_gemm(
             uint col = i % BK;  // n offset
             uint co_idx = co_base + row;
             uint n_idx = bn + col;
-            if (co_idx < Co && n_idx < N) {
-                smem_a[row * BK + col] = grad_output[n_idx * Co + co_idx];
-            } else {
-                smem_a[row * BK + col] = 0.0f;
-            }
+            smem_a[row * BK + col] = (co_idx < Co && n_idx < N) ?
+                grad_output[n_idx * Co + co_idx] : 0.0f;
         }
 
         // smem_b[BK][B2] = input gathered via neighbor
         // vci_base + col maps to (v, ci): v = idx / Ci, ci = idx % Ci
-        // For each n (bn+row): gather input[neighbor[n, v], ci]
         for (uint i = lid; i < BK * B2; i += threads) {
             uint row = i / B2;  // n offset
             uint col = i % B2;  // vci offset
@@ -304,11 +297,8 @@ kernel void spconv_bwd_weight_implicit_gemm(
                 uint v_idx = vci_idx / Ci;
                 uint ci_idx = vci_idx % Ci;
                 uint nb = neighbor[n_idx * V + v_idx];
-                if (nb != SENTINEL) {
-                    smem_b[row * B2 + col] = input[nb * Ci + ci_idx];
-                } else {
-                    smem_b[row * B2 + col] = 0.0f;
-                }
+                smem_b[row * B2 + col] = (nb != SENTINEL) ?
+                    input[nb * Ci + ci_idx] : 0.0f;
             } else {
                 smem_b[row * B2 + col] = 0.0f;
             }
@@ -316,28 +306,35 @@ kernel void spconv_bwd_weight_implicit_gemm(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint k = 0; k < BK; k++) {
-            for (uint tm = 0; tm < TM; tm++) {
-                float a_val = smem_a[(ty * TM + tm) * BK + k];
-                for (uint tn = 0; tn < TN; tn++) {
-                    acc[tm][tn] += a_val * smem_b[k * B2 + tx * TN + tn];
-                }
+        // simdgroup_matrix multiply
+        simdgroup_matrix<float, 8, 8> a_mat;
+        for (uint k8 = 0; k8 < BK; k8 += 8) {
+            simdgroup_load(a_mat, smem_a + simd_id * 8 * BK + k8, BK);
+            for (uint tn = 0; tn < TILES_N; tn++) {
+                simdgroup_matrix<float, 8, 8> b_mat;
+                simdgroup_load(b_mat, smem_b + k8 * B2 + tn * 8, B2);
+                simdgroup_multiply_accumulate(acc[tn], a_mat, b_mat, acc[tn]);
             }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store grad_weight[co, v, ci]
-    for (uint tm = 0; tm < TM; tm++) {
-        uint co = co_base + ty * TM + tm;
-        if (co >= Co) continue;
-        for (uint tn = 0; tn < TN; tn++) {
-            uint vci = vci_base + tx * TN + tn;
-            if (vci >= VCi) continue;
+    // Store results to shared memory then global
+    for (uint tn = 0; tn < TILES_N; tn++) {
+        simdgroup_store(acc[tn], smem_a + simd_id * 8 * B2 + tn * 8, B2);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid; i < B1 * B2; i += threads) {
+        uint row = i / B2;
+        uint col = i % B2;
+        uint co = co_base + row;
+        uint vci = vci_base + col;
+        if (co < Co && vci < VCi) {
             uint v_idx = vci / Ci;
             uint ci_idx = vci % Ci;
-            grad_weight[(co * V + v_idx) * Ci + ci_idx] = acc[tm][tn];
+            grad_weight[(co * V + v_idx) * Ci + ci_idx] = smem_a[row * B2 + col];
         }
     }
 }

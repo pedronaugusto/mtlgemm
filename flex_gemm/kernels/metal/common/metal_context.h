@@ -35,6 +35,26 @@ public:
 
     void synchronize();
 
+    // Batched dispatch: encode multiple kernels into one command buffer
+    void begin_batch();
+    void end_batch();  // commits and waits
+
+    // Dispatch that uses active batch if available, otherwise standalone
+    void dispatch_batched(
+        const std::string& kernel_name,
+        std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+        uint64_t thread_count
+    );
+
+    void dispatch_2d_batched(
+        const std::string& kernel_name,
+        std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+        MTLSize grid_size,
+        MTLSize threadgroup_size
+    );
+
+    bool in_batch() const { return batch_active_; }
+
 private:
     MetalContext();
     ~MetalContext() = default;
@@ -45,6 +65,9 @@ private:
     id<MTLCommandQueue> queue_;
     id<MTLLibrary> library_;
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipeline_cache_;
+
+    bool batch_active_ = false;
+    id<MTLCommandBuffer> batch_cmdbuf_ = nil;
 };
 
 } // namespace metal

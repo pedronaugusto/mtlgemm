@@ -133,6 +133,72 @@ void MetalContext::dispatch_2d(
     }
 }
 
+void MetalContext::begin_batch() {
+    if (batch_active_) {
+        throw std::runtime_error("begin_batch called while already in a batch");
+    }
+    batch_cmdbuf_ = [queue_ commandBuffer];
+    batch_active_ = true;
+}
+
+void MetalContext::end_batch() {
+    if (!batch_active_) {
+        throw std::runtime_error("end_batch called without an active batch");
+    }
+    [batch_cmdbuf_ commit];
+    [batch_cmdbuf_ waitUntilCompleted];
+    batch_cmdbuf_ = nil;
+    batch_active_ = false;
+}
+
+void MetalContext::dispatch_batched(
+    const std::string& kernel_name,
+    std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+    uint64_t thread_count
+) {
+    if (!batch_active_) {
+        // Fall through to standalone dispatch
+        dispatch(kernel_name, buffer_setup, thread_count);
+        return;
+    }
+
+    if (thread_count == 0) return;
+
+    auto pso = pipeline(kernel_name);
+    uint64_t threadgroup_size = std::min((uint64_t)pso.maxTotalThreadsPerThreadgroup, (uint64_t)BLOCK_SIZE);
+    if (threadgroup_size > 256) threadgroup_size = 256;
+
+    uint64_t grid_size = ((thread_count + threadgroup_size - 1) / threadgroup_size) * threadgroup_size;
+
+    id<MTLComputeCommandEncoder> encoder = [batch_cmdbuf_ computeCommandEncoder];
+    [encoder setComputePipelineState:pso];
+    buffer_setup(encoder);
+    [encoder dispatchThreads:MTLSizeMake(grid_size, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+    [encoder endEncoding];
+}
+
+void MetalContext::dispatch_2d_batched(
+    const std::string& kernel_name,
+    std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+    MTLSize grid_size,
+    MTLSize threadgroup_size
+) {
+    if (!batch_active_) {
+        dispatch_2d(kernel_name, buffer_setup, grid_size, threadgroup_size);
+        return;
+    }
+
+    auto pso = pipeline(kernel_name);
+
+    id<MTLComputeCommandEncoder> encoder = [batch_cmdbuf_ computeCommandEncoder];
+    [encoder setComputePipelineState:pso];
+    buffer_setup(encoder);
+    [encoder dispatchThreadgroups:grid_size
+            threadsPerThreadgroup:threadgroup_size];
+    [encoder endEncoding];
+}
+
 void MetalContext::synchronize() {
     @autoreleasepool {
         id<MTLCommandBuffer> cmdbuf = [queue_ commandBuffer];
