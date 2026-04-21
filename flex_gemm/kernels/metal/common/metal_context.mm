@@ -1,4 +1,5 @@
 #import "metal_context.h"
+#import <ATen/mps/MPSStream.h>
 #include <stdexcept>
 #include <dlfcn.h>
 #include "dtypes.h"
@@ -205,6 +206,98 @@ void MetalContext::synchronize() {
         [cmdbuf commit];
         [cmdbuf waitUntilCompleted];
     }
+}
+
+void MetalContext::dispatch_threadgroups(
+    const std::string& kernel_name,
+    std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+    MTLSize grid_size,
+    MTLSize threadgroup_size,
+    bool wait
+) {
+    auto pso = pipeline(kernel_name);
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdbuf = [queue_ commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdbuf computeCommandEncoder];
+
+        [encoder setComputePipelineState:pso];
+        buffer_setup(encoder);
+
+        [encoder dispatchThreadgroups:grid_size
+                threadsPerThreadgroup:threadgroup_size];
+        [encoder endEncoding];
+        [cmdbuf commit];
+        if (wait) {
+            [cmdbuf waitUntilCompleted];
+        }
+    }
+}
+
+// ============================================================================
+// MPS-stream dispatch — encode into PyTorch's MPSStream command buffer so the
+// kernel sequences correctly with surrounding torch.mps ops without paying a
+// CPU sync per call. PyTorch commits the buffer at its next sync point.
+// ============================================================================
+
+void MetalContext::dispatch_mps(
+    const std::string& kernel_name,
+    std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+    uint64_t thread_count
+) {
+    if (thread_count == 0) return;
+
+    auto pso = pipeline(kernel_name);
+    uint64_t threadgroup_size = std::min((uint64_t)pso.maxTotalThreadsPerThreadgroup, (uint64_t)BLOCK_SIZE);
+    if (threadgroup_size > 256) threadgroup_size = 256;
+
+    uint64_t grid_size = ((thread_count + threadgroup_size - 1) / threadgroup_size) * threadgroup_size;
+
+    auto* stream = at::mps::getCurrentMPSStream();
+    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmdbuf = stream->commandBuffer();
+            id<MTLComputeCommandEncoder> encoder = [cmdbuf computeCommandEncoder];
+            [encoder setComputePipelineState:pso];
+            buffer_setup(encoder);
+            [encoder dispatchThreads:MTLSizeMake(grid_size, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+            [encoder endEncoding];
+        }
+    });
+}
+
+void MetalContext::dispatch_2d_mps(
+    const std::string& kernel_name,
+    std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+    MTLSize grid_size,
+    MTLSize threadgroup_size
+) {
+    auto pso = pipeline(kernel_name);
+
+    auto* stream = at::mps::getCurrentMPSStream();
+    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmdbuf = stream->commandBuffer();
+            id<MTLComputeCommandEncoder> encoder = [cmdbuf computeCommandEncoder];
+            [encoder setComputePipelineState:pso];
+            buffer_setup(encoder);
+            [encoder dispatchThreadgroups:grid_size
+                    threadsPerThreadgroup:threadgroup_size];
+            [encoder endEncoding];
+        }
+    });
+}
+
+void MetalContext::dispatch_threadgroups_mps(
+    const std::string& kernel_name,
+    std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+    MTLSize grid_size,
+    MTLSize threadgroup_size
+) {
+    // Identical encoding semantics to dispatch_2d_mps — kept as a separate name
+    // for readability at the call sites that explicitly pre-compute tile geometry.
+    dispatch_2d_mps(kernel_name, buffer_setup, grid_size, threadgroup_size);
 }
 
 } // namespace metal

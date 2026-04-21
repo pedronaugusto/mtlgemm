@@ -33,6 +33,39 @@ public:
         MTLSize threadgroup_size
     );
 
+    // Threadgroup-level dispatch (dispatchThreadgroups, not dispatchThreads).
+    // For tiled GEMM kernels that use specific block sizes. CPU/private-queue path.
+    // wait=false skips waitUntilCompleted for non-final dispatches in a sequence.
+    void dispatch_threadgroups(
+        const std::string& kernel_name,
+        std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+        MTLSize grid_size,
+        MTLSize threadgroup_size,
+        bool wait
+    );
+
+    // MPS-mode dispatch: encodes into the active PyTorch MPSStream so the
+    // kernel orders correctly with surrounding ops and PyTorch handles commit.
+    void dispatch_mps(
+        const std::string& kernel_name,
+        std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+        uint64_t thread_count
+    );
+
+    void dispatch_2d_mps(
+        const std::string& kernel_name,
+        std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+        MTLSize grid_size,
+        MTLSize threadgroup_size
+    );
+
+    void dispatch_threadgroups_mps(
+        const std::string& kernel_name,
+        std::function<void(id<MTLComputeCommandEncoder>)> buffer_setup,
+        MTLSize grid_size,
+        MTLSize threadgroup_size
+    );
+
     void synchronize();
 
     // Batched dispatch: encode multiple kernels into one command buffer
