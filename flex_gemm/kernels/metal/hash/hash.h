@@ -141,6 +141,82 @@ inline uint linear_probing_lookup_u64(
 }
 
 // ============================================================================
+// Linear probing — uint64 keys, packed layout.
+//
+// The split (hi, lo) path above exists for CPU-mode dispatch, where PyTorch
+// u64 tensors are decomposed into two u32 tensors via torch::from_blob so
+// the resulting (hi, lo) buffers are stable Metal buffers. On MPS the split
+// requires copies (slice is a strided view; it must be `.contiguous()`d,
+// which allocates).
+//
+// The packed variant below takes a single buffer that views the u64 hashmap
+// as interleaved u32 pairs [lo0, hi0, lo1, hi1, ...] (PyTorch's u64 layout
+// on Apple Silicon, little-endian). CAS on u32 is fully supported; Metal's
+// 64-bit atomic CAS is not. Same algorithm as the (hi, lo) split: CAS the
+// hi half of the slot to claim it, then write lo + value. Zero-copy on MPS
+// because we reinterpret the u64 tensor's underlying MTLBuffer as a u32
+// stream — the backing memory is identical.
+// ============================================================================
+
+inline void linear_probing_insert_u64_packed(
+    device atomic_uint* packed_keys,   // interleaved [lo0, hi0, lo1, hi1, ...]
+    device uint* hashmap_values,
+    ulong key,
+    uint value,
+    uint N
+) {
+    uint hi = (uint)(key >> 32);
+    uint lo = (uint)(key & 0xFFFFFFFFULL);
+    uint slot = (uint)murmur3_64(key, N);
+
+    while (true) {
+        uint hi_idx = slot * 2 + 1;
+        uint lo_idx = slot * 2;
+        uint exp_hi = 0xFFFFFFFFu;
+        if (atomic_compare_exchange_weak_explicit(
+                &packed_keys[hi_idx], &exp_hi, hi,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&packed_keys[lo_idx], lo, memory_order_relaxed);
+            hashmap_values[slot] = value;
+            return;
+        }
+        if (exp_hi == hi) {
+            uint cur_lo = atomic_load_explicit(&packed_keys[lo_idx], memory_order_relaxed);
+            if (cur_lo == lo) {
+                hashmap_values[slot] = value;
+                return;
+            }
+        }
+        slot = (slot + 1) % N;
+    }
+}
+
+inline uint linear_probing_lookup_u64_packed(
+    const device uint* packed_keys,   // interleaved [lo0, hi0, lo1, hi1, ...]
+    const device uint* hashmap_values,
+    ulong key,
+    uint N
+) {
+    uint hi = (uint)(key >> 32);
+    uint lo = (uint)(key & 0xFFFFFFFFULL);
+    uint slot = (uint)murmur3_64(key, N);
+
+    while (true) {
+        uint kh = packed_keys[slot * 2 + 1];
+        if (kh == 0xFFFFFFFFu) {
+            return 0xFFFFFFFFu;
+        }
+        if (kh == hi) {
+            uint kl = packed_keys[slot * 2];
+            if (kl == lo) {
+                return hashmap_values[slot];
+            }
+        }
+        slot = (slot + 1) % N;
+    }
+}
+
+// ============================================================================
 // 3D coordinate flattening
 // ============================================================================
 

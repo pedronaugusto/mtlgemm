@@ -109,6 +109,59 @@ kernel void submanifold_conv_neighbor_map_u64(
 }
 
 // ============================================================================
+// Submanifold conv neighbor map — uint64 keys (direct atomic_ulong path)
+// Used on the MPS dispatch path to avoid the hi/lo split copy — see hash.h.
+// ============================================================================
+
+kernel void submanifold_conv_neighbor_map_u64_packed(
+    const device uint* packed_keys    [[buffer(0)]],
+    const device uint* hashmap_vals   [[buffer(1)]],
+    const device int* coords          [[buffer(2)]],
+    device uint* neighbor             [[buffer(3)]],
+    constant uint& hash_N             [[buffer(4)]],
+    constant uint& M                  [[buffer(5)]],
+    constant int& W                   [[buffer(6)]],
+    constant int& H                   [[buffer(7)]],
+    constant int& D                   [[buffer(8)]],
+    constant int& V                   [[buffer(9)]],
+    constant int& Kw                  [[buffer(10)]],
+    constant int& Kh                  [[buffer(11)]],
+    constant int& Kd                  [[buffer(12)]],
+    constant int& Dw                  [[buffer(13)]],
+    constant int& Dh                  [[buffer(14)]],
+    constant int& Dd                  [[buffer(15)]],
+    uint tid                          [[thread_position_in_grid]]
+) {
+    int half_V = V / 2 + 1;
+    uint idx = tid / half_V;
+    if (idx >= M) return;
+
+    int b = coords[idx * 4 + 0];
+    int cx = coords[idx * 4 + 1] - Kw / 2 * Dw;
+    int cy = coords[idx * 4 + 2] - Kh / 2 * Dh;
+    int cz = coords[idx * 4 + 3] - Kd / 2 * Dd;
+    int KhKd = Kh * Kd;
+    int v = tid % half_V;
+
+    uint value = 0xFFFFFFFFu;
+    if (v == half_V - 1) {
+        value = idx;
+    } else {
+        int kx = cx + v / KhKd * Dw;
+        int ky = cy + v / Kd % Kh * Dh;
+        int kz = cz + v % Kd * Dd;
+        if (kx >= 0 && kx < W && ky >= 0 && ky < H && kz >= 0 && kz < D) {
+            ulong key = flatten_3d(b, kx, ky, kz, W, H, D);
+            value = linear_probing_lookup_u64_packed(packed_keys, hashmap_vals, key, hash_N);
+            if (value != 0xFFFFFFFFu) {
+                neighbor[value * V + V - 1 - v] = idx;
+            }
+        }
+    }
+    neighbor[idx * V + v] = value;
+}
+
+// ============================================================================
 // Neighbor map → gray/binary code + transpose
 // Uses threadgroup shared memory for the transpose
 // ============================================================================

@@ -329,8 +329,6 @@ void hashmap_insert_3d_cuda(
 
     bool on_mps = coords.device().is_mps();
     if (on_mps) {
-        TORCH_CHECK(hashmap_keys.dtype() != torch::kUInt64,
-            "uint64 hashmap keys are not yet supported on MPS — use a smaller spatial volume that fits in uint32 keys");
         hashmap_keys = hashmap_keys.contiguous();
         hashmap_values = hashmap_values.contiguous();
     } else {
@@ -343,13 +341,29 @@ void hashmap_insert_3d_cuda(
     auto buf_vals = from_tensor(values);
 
     if (hashmap_keys.dtype() == torch::kUInt64) {
-        // uint64 keys: split into hi/lo uint32 buffers
         uint32_t N = (uint32_t)hashmap_keys.size(0);
-        auto keys_u64 = hashmap_keys;
-        auto keys_flat = keys_u64.view({-1}).contiguous();
-        // Reinterpret as uint32 pairs: [N] u64 → [N*2] u32 (little-endian: lo, hi)
+
+        if (on_mps) {
+            // Direct u64: zero-copy against the u64 tensor via atomic_ulong.
+            auto buf_hk = from_tensor_inplace(hashmap_keys);
+            auto buf_hv = from_tensor_inplace(hashmap_values);
+            ctx().dispatch_mps("hashmap_insert_3d_u64_packed", [&](id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:buf_hk.buffer     offset:buf_hk.offset     atIndex:0];
+                [enc setBuffer:buf_hv.buffer     offset:buf_hv.offset     atIndex:1];
+                [enc setBuffer:buf_coords.buffer offset:buf_coords.offset atIndex:2];
+                [enc setBuffer:buf_vals.buffer   offset:buf_vals.offset   atIndex:3];
+                [enc setBytes:&N length:sizeof(N) atIndex:4];
+                [enc setBytes:&M length:sizeof(M) atIndex:5];
+                [enc setBytes:&W length:sizeof(W) atIndex:6];
+                [enc setBytes:&H length:sizeof(H) atIndex:7];
+                [enc setBytes:&D length:sizeof(D) atIndex:8];
+            }, M);
+            return;
+        }
+
+        // CPU path: split into hi/lo u32 pairs via from_blob.
+        auto keys_flat = hashmap_keys.view({-1}).contiguous();
         auto keys_u32 = torch::from_blob(keys_flat.data_ptr(), {(int64_t)N * 2}, torch::kUInt32).clone();
-        // On little-endian: keys_u32[2*i] = lo, keys_u32[2*i+1] = hi
         auto keys_lo = keys_u32.slice(0, 0, N * 2, 2).contiguous();  // even indices
         auto keys_hi = keys_u32.slice(0, 1, N * 2, 2).contiguous();  // odd indices
 
@@ -357,7 +371,6 @@ void hashmap_insert_3d_cuda(
         auto buf_lo = from_tensor_inplace(keys_lo);
         auto buf_hv = from_tensor_inplace(hashmap_values);
 
-        // CPU-only path — uint64 MPS support not yet implemented (TORCH_CHECK above).
         ctx().dispatch("hashmap_insert_3d_u64", [&](id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:buf_hi.buffer offset:0 atIndex:0];
             [enc setBuffer:buf_lo.buffer offset:0 atIndex:1];
@@ -373,9 +386,7 @@ void hashmap_insert_3d_cuda(
 
         if (hashmap_values.data_ptr() != buf_hv.backing.data_ptr())
             memcpy(hashmap_values.data_ptr(), buf_hv.backing.data_ptr(), hashmap_values.nbytes());
-        // Rejoin hi/lo back into uint64 tensor — backing tensors already have GPU results
         auto rejoined = torch::empty({(int64_t)N * 2}, torch::kUInt32);
-        // Interleave: lo at even, hi at odd
         for (uint32_t i = 0; i < N; i++) {
             ((uint32_t*)rejoined.data_ptr())[2*i]     = ((uint32_t*)buf_lo.backing.data_ptr())[i];
             ((uint32_t*)rejoined.data_ptr())[2*i + 1] = ((uint32_t*)buf_hi.backing.data_ptr())[i];
@@ -416,18 +427,32 @@ torch::Tensor hashmap_lookup_3d_cuda(
     int W, int H, int D
 ) {
     bool on_mps = coords.device().is_mps();
-    if (on_mps) {
-        TORCH_CHECK(hashmap_keys.dtype() != torch::kUInt64,
-            "uint64 hashmap keys are not yet supported on MPS — use a smaller spatial volume that fits in uint32 keys");
-    }
     uint32_t N = (uint32_t)hashmap_keys.size(0);
     uint32_t M = (uint32_t)coords.size(0);
 
     auto buf_coords = from_tensor(coords);
     auto out = make_output({(int64_t)M}, hashmap_values.scalar_type(), coords.device());
 
+    if (hashmap_keys.dtype() == torch::kUInt64 && on_mps) {
+        // Direct u64 lookup on MPS.
+        auto buf_hk = from_tensor(hashmap_keys);
+        auto buf_hv = from_tensor(hashmap_values);
+        ctx().dispatch_mps("hashmap_lookup_3d_u64_packed", [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:buf_hk.buffer     offset:buf_hk.offset     atIndex:0];
+            [enc setBuffer:buf_hv.buffer     offset:buf_hv.offset     atIndex:1];
+            [enc setBuffer:buf_coords.buffer offset:buf_coords.offset atIndex:2];
+            [enc setBuffer:out.buffer        offset:out.offset        atIndex:3];
+            [enc setBytes:&N length:sizeof(N) atIndex:4];
+            [enc setBytes:&M length:sizeof(M) atIndex:5];
+            [enc setBytes:&W length:sizeof(W) atIndex:6];
+            [enc setBytes:&H length:sizeof(H) atIndex:7];
+            [enc setBytes:&D length:sizeof(D) atIndex:8];
+        }, M);
+        return out.backing;
+    }
+
     if (hashmap_keys.dtype() == torch::kUInt64) {
-        // CPU-only path — uint64 MPS support not yet implemented.
+        // CPU path: split into hi/lo.
         auto keys_flat = hashmap_keys.contiguous().view({-1});
         auto keys_u32 = torch::from_blob(keys_flat.data_ptr(), {(int64_t)N * 2}, torch::kUInt32).clone();
         auto keys_lo = keys_u32.slice(0, 0, N * 2, 2).contiguous();
@@ -479,8 +504,6 @@ void hashmap_insert_3d_idx_as_val_cuda(
 ) {
     bool on_mps = coords.device().is_mps();
     if (on_mps) {
-        TORCH_CHECK(hashmap_keys.dtype() != torch::kUInt64,
-            "uint64 hashmap keys are not yet supported on MPS — use a smaller spatial volume that fits in uint32 keys");
         hashmap_keys = hashmap_keys.contiguous();
         hashmap_values = hashmap_values.contiguous();
     } else {
@@ -490,6 +513,23 @@ void hashmap_insert_3d_idx_as_val_cuda(
     uint32_t M = (uint32_t)coords.size(0);
 
     auto buf_coords = from_tensor(coords);
+
+    if (hashmap_keys.dtype() == torch::kUInt64 && on_mps) {
+        uint32_t N = (uint32_t)hashmap_keys.size(0);
+        auto buf_hk = from_tensor_inplace(hashmap_keys);
+        auto buf_hv = from_tensor_inplace(hashmap_values);
+        ctx().dispatch_mps("hashmap_insert_3d_idx_as_val_u64_packed", [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:buf_hk.buffer     offset:buf_hk.offset     atIndex:0];
+            [enc setBuffer:buf_hv.buffer     offset:buf_hv.offset     atIndex:1];
+            [enc setBuffer:buf_coords.buffer offset:buf_coords.offset atIndex:2];
+            [enc setBytes:&N length:sizeof(N) atIndex:3];
+            [enc setBytes:&M length:sizeof(M) atIndex:4];
+            [enc setBytes:&W length:sizeof(W) atIndex:5];
+            [enc setBytes:&H length:sizeof(H) atIndex:6];
+            [enc setBytes:&D length:sizeof(D) atIndex:7];
+        }, M);
+        return;
+    }
 
     if (hashmap_keys.dtype() == torch::kUInt64) {
         uint32_t N = (uint32_t)hashmap_keys.size(0);
@@ -895,33 +935,59 @@ torch::Tensor hashmap_build_submanifold_conv_neighbour_map_cuda(
     auto buf_coords = from_tensor(coords);
 
     if (hashmap_keys.dtype() == torch::kUInt64) {
-        // CPU-only path — uint64 MPS support not yet implemented (gated upstream).
-        auto keys_flat = hashmap_keys.contiguous().view({-1});
-        auto keys_u32 = torch::from_blob(keys_flat.data_ptr(), {(int64_t)hash_N * 2}, torch::kUInt32).clone();
-        auto klo = keys_u32.slice(0, 0, hash_N * 2, 2).contiguous();
-        auto khi = keys_u32.slice(0, 1, hash_N * 2, 2).contiguous();
-        auto buf_hi = from_tensor(khi);
-        auto buf_lo = from_tensor(klo);
+        if (on_mps) {
+            // Direct u64 path — take the u64 tensor zero-copy and run the
+            // atomic_ulong kernel (requires Metal 4.0 and Apple Silicon;
+            // gated by -D__HAVE_ATOMIC_ULONG__=1 in setup.py).
+            ctx().dispatch_mps("submanifold_conv_neighbor_map_u64_packed", [&](id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:buf_hk.buffer     offset:buf_hk.offset     atIndex:0];
+                [enc setBuffer:buf_hv.buffer     offset:buf_hv.offset     atIndex:1];
+                [enc setBuffer:buf_coords.buffer offset:buf_coords.offset atIndex:2];
+                [enc setBuffer:buf_neigh.buffer  offset:buf_neigh.offset  atIndex:3];
+                [enc setBytes:&hash_N length:sizeof(hash_N) atIndex:4];
+                [enc setBytes:&M length:sizeof(M) atIndex:5];
+                [enc setBytes:&W length:sizeof(W) atIndex:6];
+                [enc setBytes:&H length:sizeof(H) atIndex:7];
+                [enc setBytes:&D length:sizeof(D) atIndex:8];
+                [enc setBytes:&V length:sizeof(V) atIndex:9];
+                [enc setBytes:&Kw length:sizeof(Kw) atIndex:10];
+                [enc setBytes:&Kh length:sizeof(Kh) atIndex:11];
+                [enc setBytes:&Kd length:sizeof(Kd) atIndex:12];
+                [enc setBytes:&Dw length:sizeof(Dw) atIndex:13];
+                [enc setBytes:&Dh length:sizeof(Dh) atIndex:14];
+                [enc setBytes:&Dd length:sizeof(Dd) atIndex:15];
+            }, thread_count);
+        } else {
+            // CPU path: decompose u64 into (hi, lo) u32 tensors (via
+            // torch::from_blob) so the slice-as-view trick gives us two
+            // Metal buffers without a separate allocation.
+            auto keys_flat = hashmap_keys.contiguous().view({-1});
+            auto keys_u32 = torch::from_blob(keys_flat.data_ptr(), {(int64_t)hash_N * 2}, torch::kUInt32).clone();
+            auto klo = keys_u32.slice(0, 0, hash_N * 2, 2).contiguous();
+            auto khi = keys_u32.slice(0, 1, hash_N * 2, 2).contiguous();
+            auto buf_hi = from_tensor(khi);
+            auto buf_lo = from_tensor(klo);
 
-        ctx().dispatch("submanifold_conv_neighbor_map_u64", [&](id<MTLComputeCommandEncoder> enc) {
-            [enc setBuffer:buf_hi.buffer offset:0 atIndex:0];
-            [enc setBuffer:buf_lo.buffer offset:0 atIndex:1];
-            [enc setBuffer:buf_hv.buffer offset:0 atIndex:2];
-            [enc setBuffer:buf_coords.buffer offset:buf_coords.offset atIndex:3];
-            [enc setBuffer:buf_neigh.buffer  offset:buf_neigh.offset  atIndex:4];
-            [enc setBytes:&hash_N length:sizeof(hash_N) atIndex:5];
-            [enc setBytes:&M length:sizeof(M) atIndex:6];
-            [enc setBytes:&W length:sizeof(W) atIndex:7];
-            [enc setBytes:&H length:sizeof(H) atIndex:8];
-            [enc setBytes:&D length:sizeof(D) atIndex:9];
-            [enc setBytes:&V length:sizeof(V) atIndex:10];
-            [enc setBytes:&Kw length:sizeof(Kw) atIndex:11];
-            [enc setBytes:&Kh length:sizeof(Kh) atIndex:12];
-            [enc setBytes:&Kd length:sizeof(Kd) atIndex:13];
-            [enc setBytes:&Dw length:sizeof(Dw) atIndex:14];
-            [enc setBytes:&Dh length:sizeof(Dh) atIndex:15];
-            [enc setBytes:&Dd length:sizeof(Dd) atIndex:16];
-        }, thread_count);
+            ctx().dispatch("submanifold_conv_neighbor_map_u64", [&](id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:buf_hi.buffer offset:0 atIndex:0];
+                [enc setBuffer:buf_lo.buffer offset:0 atIndex:1];
+                [enc setBuffer:buf_hv.buffer offset:0 atIndex:2];
+                [enc setBuffer:buf_coords.buffer offset:buf_coords.offset atIndex:3];
+                [enc setBuffer:buf_neigh.buffer  offset:buf_neigh.offset  atIndex:4];
+                [enc setBytes:&hash_N length:sizeof(hash_N) atIndex:5];
+                [enc setBytes:&M length:sizeof(M) atIndex:6];
+                [enc setBytes:&W length:sizeof(W) atIndex:7];
+                [enc setBytes:&H length:sizeof(H) atIndex:8];
+                [enc setBytes:&D length:sizeof(D) atIndex:9];
+                [enc setBytes:&V length:sizeof(V) atIndex:10];
+                [enc setBytes:&Kw length:sizeof(Kw) atIndex:11];
+                [enc setBytes:&Kh length:sizeof(Kh) atIndex:12];
+                [enc setBytes:&Kd length:sizeof(Kd) atIndex:13];
+                [enc setBytes:&Dw length:sizeof(Dw) atIndex:14];
+                [enc setBytes:&Dh length:sizeof(Dh) atIndex:15];
+                [enc setBytes:&Dd length:sizeof(Dd) atIndex:16];
+            }, thread_count);
+        }
     } else {
         dispatch_auto(on_mps, "submanifold_conv_neighbor_map_u32", [&](id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:buf_hk.buffer     offset:buf_hk.offset     atIndex:0];
