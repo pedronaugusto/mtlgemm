@@ -256,6 +256,7 @@ void MetalContext::dispatch_mps(
     auto* stream = at::mps::getCurrentMPSStream();
     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
         @autoreleasepool {
+            stream->endKernelCoalescing();
             id<MTLCommandBuffer> cmdbuf = stream->commandBuffer();
             id<MTLComputeCommandEncoder> encoder = [cmdbuf computeCommandEncoder];
             [encoder setComputePipelineState:pso];
@@ -278,6 +279,11 @@ void MetalContext::dispatch_2d_mps(
     auto* stream = at::mps::getCurrentMPSStream();
     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
         @autoreleasepool {
+            // Close any encoder PyTorch's kernel-coalescing layer left open
+            // on the current cmdbuf; without this, computeCommandEncoder
+            // asserts "A command encoder is already encoding to this command
+            // buffer" when we dispatch two of our own kernels back-to-back.
+            stream->endKernelCoalescing();
             id<MTLCommandBuffer> cmdbuf = stream->commandBuffer();
             id<MTLComputeCommandEncoder> encoder = [cmdbuf computeCommandEncoder];
             [encoder setComputePipelineState:pso];

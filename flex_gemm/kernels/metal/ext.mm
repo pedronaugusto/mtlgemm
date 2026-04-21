@@ -21,6 +21,12 @@ static inline id<MTLBuffer> getMTLBufferStorage(const at::TensorBase& tensor) {
 #include <dlfcn.h>
 #include <chrono>
 #include <mutex>
+#include <fstream>
+#include <sstream>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <unistd.h>
 
 #define BLOCK_SIZE 256
 
@@ -214,33 +220,195 @@ static inline void dispatch_2d_auto(
 
 // ============================================================================
 // Spconv GEMM autotune timing cache
-// Records kernel execution times per shape to verify tile config is optimal
-// and to support future multi-config autotuning.
+//
+// Records per-shape-key rolling EMA timings for both the default tile64 and
+// the wide-tile128 kernels. When FLEX_GEMM_AUTOTUNE_ADAPTIVE=1 is set, the
+// dispatcher reads the cache and picks the faster tile per call.
+//
+// Persistence: path from FLEX_GEMM_AUTOTUNE_CACHE env, else
+// ~/.cache/flex_gemm/autotune.json. Loaded once on first use; saved on
+// process exit via an atexit-registered Python callback, and also every
+// `SAVE_EVERY_N` writes as a crash safety net.
 // ============================================================================
+
+static std::string autotune_cache_path() {
+    const char* env = std::getenv("FLEX_GEMM_AUTOTUNE_CACHE");
+    if (env && *env) return env;
+    // Resolve ~/.cache/flex_gemm/autotune.json
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) {
+        struct passwd* pw = getpwuid(getuid());
+        if (pw && pw->pw_dir) home = pw->pw_dir;
+    }
+    if (!home || !*home) return "";
+    return std::string(home) + "/.cache/flex_gemm/autotune.json";
+}
+
+static void ensure_parent_dir(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return;
+    std::string parent = path.substr(0, slash);
+    if (parent.empty()) return;
+    // mkdir -p
+    std::string acc;
+    for (size_t i = 0; i < parent.size(); ++i) {
+        if (parent[i] == '/' && !acc.empty()) {
+            mkdir(acc.c_str(), 0755);
+        }
+        acc += parent[i];
+    }
+    mkdir(acc.c_str(), 0755);
+}
 
 static struct SpconvTimingCache {
     std::mutex mu;
-    // Key: (N_bucket, Ci, Co, V) → avg time in microseconds (EMA)
-    std::unordered_map<uint64_t, float> cache;
+    struct Entry {
+        float us_tile64  = 0.0f;  // 0 = unprobed
+        float us_tile128 = 0.0f;  // 0 = unprobed
+    };
+    // Key: (N_bucket, Ci, Co, V) → {tile64_us, tile128_us} rolling EMAs.
+    std::unordered_map<uint64_t, Entry> cache;
+    int writes_since_save = 0;
+    bool loaded = false;
+    static constexpr int SAVE_EVERY_N = 32;
 
     static uint64_t key(uint32_t N, uint32_t Ci, uint32_t Co, uint32_t V) {
-        // Bucket N to nearest power of 2 for cache coherence
         uint32_t nb = 1;
         while (nb < N) nb <<= 1;
         return (uint64_t(nb) << 48) | (uint64_t(Ci) << 32) | (uint64_t(Co) << 16) | V;
     }
 
-    void record(uint32_t N, uint32_t Ci, uint32_t Co, uint32_t V, float us) {
+    static void decode_key(uint64_t k, uint32_t& nb, uint32_t& Ci, uint32_t& Co, uint32_t& V) {
+        nb = (uint32_t)((k >> 48) & 0xFFFFu);
+        Ci = (uint32_t)((k >> 32) & 0xFFFFu);
+        Co = (uint32_t)((k >> 16) & 0xFFFFu);
+        V  = (uint32_t)(k & 0xFFFFu);
+    }
+
+    void record_tile64(uint32_t N, uint32_t Ci, uint32_t Co, uint32_t V, float us) {
         std::lock_guard<std::mutex> lock(mu);
-        auto k = key(N, Ci, Co, V);
-        auto it = cache.find(k);
-        if (it == cache.end()) {
-            cache[k] = us;
-        } else {
-            it->second = 0.9f * it->second + 0.1f * us; // EMA
+        auto& e = cache[key(N, Ci, Co, V)];
+        e.us_tile64 = (e.us_tile64 == 0.0f) ? us : 0.9f * e.us_tile64 + 0.1f * us;
+        _maybe_save_locked();
+    }
+
+    void record_tile128(uint32_t N, uint32_t Ci, uint32_t Co, uint32_t V, float us) {
+        std::lock_guard<std::mutex> lock(mu);
+        auto& e = cache[key(N, Ci, Co, V)];
+        e.us_tile128 = (e.us_tile128 == 0.0f) ? us : 0.9f * e.us_tile128 + 0.1f * us;
+        _maybe_save_locked();
+    }
+
+    // Returns true if we have timings for both tiles and tile128 is faster.
+    bool tile128_preferred(uint32_t N, uint32_t Ci, uint32_t Co, uint32_t V) {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(key(N, Ci, Co, V));
+        if (it == cache.end()) return false;
+        const Entry& e = it->second;
+        if (e.us_tile64 == 0.0f || e.us_tile128 == 0.0f) return false;
+        return e.us_tile128 < e.us_tile64;
+    }
+
+    // Returns true if we have NOT yet probed both tiles for this shape —
+    // caller should probe the missing one to complete the cache entry.
+    bool needs_probe(uint32_t N, uint32_t Ci, uint32_t Co, uint32_t V, bool probe_tile128) {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(key(N, Ci, Co, V));
+        if (it == cache.end()) return true;
+        const Entry& e = it->second;
+        return probe_tile128 ? (e.us_tile128 == 0.0f) : (e.us_tile64 == 0.0f);
+    }
+
+    void _maybe_save_locked() {
+        if (++writes_since_save >= SAVE_EVERY_N) {
+            writes_since_save = 0;
+            _save_locked();
         }
     }
+
+    void load() {
+        std::lock_guard<std::mutex> lock(mu);
+        if (loaded) return;
+        loaded = true;
+        std::string path = autotune_cache_path();
+        if (path.empty()) return;
+        std::ifstream in(path);
+        if (!in) return;
+        // Minimal JSON reader: keys list of objects {nb, ci, co, v, us_tile64, us_tile128}.
+        std::stringstream ss;
+        ss << in.rdbuf();
+        std::string s = ss.str();
+        // Find each object.
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t obj_start = s.find('{', i);
+            if (obj_start == std::string::npos) break;
+            size_t obj_end = s.find('}', obj_start);
+            if (obj_end == std::string::npos) break;
+            std::string obj = s.substr(obj_start + 1, obj_end - obj_start - 1);
+            auto read_num = [&](const char* key) -> double {
+                std::string needle = std::string("\"") + key + "\"";
+                size_t kp = obj.find(needle);
+                if (kp == std::string::npos) return -1.0;
+                size_t colon = obj.find(':', kp);
+                if (colon == std::string::npos) return -1.0;
+                size_t j = colon + 1;
+                while (j < obj.size() && (obj[j] == ' ' || obj[j] == '\t')) ++j;
+                size_t end = j;
+                while (end < obj.size() && obj[end] != ',' && obj[end] != '}') ++end;
+                try { return std::stod(obj.substr(j, end - j)); } catch (...) { return -1.0; }
+            };
+            double nb = read_num("nb");
+            double ci = read_num("ci");
+            double co = read_num("co");
+            double v  = read_num("v");
+            double u1 = read_num("us_tile64");
+            double u2 = read_num("us_tile128");
+            if (nb > 0 && ci >= 0 && co >= 0 && v >= 0) {
+                uint64_t k = ((uint64_t)nb << 48) | ((uint64_t)ci << 32) | ((uint64_t)co << 16) | (uint64_t)v;
+                Entry e;
+                if (u1 > 0) e.us_tile64  = (float)u1;
+                if (u2 > 0) e.us_tile128 = (float)u2;
+                cache[k] = e;
+            }
+            i = obj_end + 1;
+        }
+    }
+
+    void save() {
+        std::lock_guard<std::mutex> lock(mu);
+        _save_locked();
+    }
+
+  private:
+    void _save_locked() {
+        std::string path = autotune_cache_path();
+        if (path.empty()) return;
+        ensure_parent_dir(path);
+        std::ofstream out(path);
+        if (!out) return;
+        out << "{\"keys\":[";
+        bool first = true;
+        for (const auto& kv : cache) {
+            uint32_t nb, Ci, Co, V;
+            decode_key(kv.first, nb, Ci, Co, V);
+            if (!first) out << ",";
+            first = false;
+            out << "{\"nb\":" << nb << ",\"ci\":" << Ci << ",\"co\":" << Co << ",\"v\":" << V
+                << ",\"us_tile64\":" << kv.second.us_tile64
+                << ",\"us_tile128\":" << kv.second.us_tile128 << "}";
+        }
+        out << "]}";
+    }
 } g_spconv_timing;
+
+static bool autotune_adaptive_enabled() {
+    static bool enabled = []() {
+        const char* env = std::getenv("FLEX_GEMM_AUTOTUNE_ADAPTIVE");
+        return env != nullptr && std::string(env) == "1";
+    }();
+    return enabled;
+}
 
 // ============================================================================
 // Hash functions
@@ -1355,11 +1523,16 @@ torch::Tensor spconv_fwd_implicit_gemm(
     uint32_t has_bias = (bias.numel() > 0) ? 1 : 0;
 
     // Grid: (cdiv(N, 64), cdiv(Co, 64 or 128)), Threadgroup: 256.
-    // Wide-tile (B2=128) is gated by FLEX_GEMM_TILE128=1. Only fp16/bf16 have
-    // tile128 kernels; fp32 stays on the 64x64 tile regardless.
-    bool tile128 = use_tile128_env()
-                   && input.scalar_type() != torch::kFloat32
-                   && Co >= 128;
+    // Tile selection:
+    //   FLEX_GEMM_TILE128=1           → force tile128 on fp16/bf16 Co>=128
+    //   FLEX_GEMM_AUTOTUNE_ADAPTIVE=1 → pick fastest via JSON cache (probes both)
+    //   default                       → tile64 (measured-winner on trellis2 shapes)
+    bool tile128_eligible = (input.scalar_type() != torch::kFloat32) && (Co >= 128);
+    bool tile128 = tile128_eligible && use_tile128_env();
+    if (tile128_eligible && !tile128 && autotune_adaptive_enabled()) {
+        g_spconv_timing.load();
+        tile128 = g_spconv_timing.tile128_preferred(N, Ci, Co, V);
+    }
     uint32_t B2_eff = tile128 ? 128 : 64;
     uint32_t grid_x = (N + 63) / 64;
     uint32_t grid_y = (Co + B2_eff - 1) / B2_eff;
@@ -1395,8 +1568,8 @@ torch::Tensor spconv_fwd_implicit_gemm(
     } else {
         // CPU path: the output tensor's storage must be valid the moment we
         // return — there is no MPS scheduler to defer reads. Always wait.
-        // FLEX_GEMM_AUTOTUNE=1 additionally records wall-clock timing.
-        bool tune = gemm_autotune_enabled();
+        // FLEX_GEMM_AUTOTUNE=1 (or _ADAPTIVE=1) records wall-clock timing.
+        bool tune = gemm_autotune_enabled() || autotune_adaptive_enabled();
         auto t0 = tune ? std::chrono::high_resolution_clock::now()
                        : std::chrono::high_resolution_clock::time_point{};
         ctx().dispatch_threadgroups(kernel_name, setup,
@@ -1406,7 +1579,48 @@ torch::Tensor spconv_fwd_implicit_gemm(
         if (tune) {
             auto t1 = std::chrono::high_resolution_clock::now();
             float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
-            g_spconv_timing.record(N, Ci, Co, V, us);
+            if (tile128) g_spconv_timing.record_tile128(N, Ci, Co, V, us);
+            else         g_spconv_timing.record_tile64(N, Ci, Co, V, us);
+        }
+    }
+
+    // Adaptive probing: if tile128 was eligible and we're in adaptive mode, make
+    // sure we probe the non-selected tile at least once so the cache can pick a
+    // winner next time. This is a one-shot per shape key.
+    if (tile128_eligible && autotune_adaptive_enabled() && !on_mps) {
+        bool missing = g_spconv_timing.needs_probe(N, Ci, Co, V, /*probe_tile128=*/!tile128);
+        if (missing) {
+            bool probe_tile128 = !tile128;
+            uint32_t probe_B2 = probe_tile128 ? 128 : 64;
+            uint32_t probe_grid_y = (Co + probe_B2 - 1) / probe_B2;
+            uint32_t probe_smem = probe_tile128
+                ? gemm_smem_fwd_input_t128(input.scalar_type())
+                : gemm_smem_fwd_input(input.scalar_type());
+            std::string probe_kernel = probe_tile128
+                ? std::string("spconv_fwd_implicit_gemm_t128") + gemm_dtype_suffix(input.scalar_type())
+                : std::string("spconv_fwd_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
+            auto probe_setup = [&](id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:buf_input.buffer    offset:buf_input.offset    atIndex:0];
+                [enc setBuffer:buf_weight.buffer   offset:buf_weight.offset   atIndex:1];
+                [enc setBuffer:bias_buf            offset:bias_offset         atIndex:2];
+                [enc setBuffer:buf_neighbor.buffer offset:buf_neighbor.offset atIndex:3];
+                [enc setBuffer:out.buffer          offset:out.offset          atIndex:4];
+                [enc setBytes:&N length:sizeof(N) atIndex:5];
+                [enc setBytes:&Co length:sizeof(Co) atIndex:6];
+                [enc setBytes:&Ci length:sizeof(Ci) atIndex:7];
+                [enc setBytes:&V length:sizeof(V) atIndex:8];
+                [enc setBytes:&has_bias length:sizeof(has_bias) atIndex:9];
+                [enc setThreadgroupMemoryLength:probe_smem atIndex:0];
+            };
+            auto t0p = std::chrono::high_resolution_clock::now();
+            ctx().dispatch_threadgroups(probe_kernel, probe_setup,
+                                        MTLSizeMake(grid_x, probe_grid_y, 1),
+                                        MTLSizeMake(256, 1, 1),
+                                        /*wait=*/true);
+            auto t1p = std::chrono::high_resolution_clock::now();
+            float us = std::chrono::duration<float, std::micro>(t1p - t0p).count();
+            if (probe_tile128) g_spconv_timing.record_tile128(N, Ci, Co, V, us);
+            else               g_spconv_timing.record_tile64(N, Ci, Co, V, us);
         }
     }
 
@@ -1467,9 +1681,12 @@ torch::Tensor spconv_fwd_masked_implicit_gemm(
     }
     uint32_t has_bias = (bias.numel() > 0) ? 1 : 0;
 
-    bool tile128 = use_tile128_env()
-                   && input.scalar_type() != torch::kFloat32
-                   && Co >= 128;
+    bool tile128_eligible = (input.scalar_type() != torch::kFloat32) && (Co >= 128);
+    bool tile128 = tile128_eligible && use_tile128_env();
+    if (tile128_eligible && !tile128 && autotune_adaptive_enabled()) {
+        g_spconv_timing.load();
+        tile128 = g_spconv_timing.tile128_preferred(N, Ci, Co, V);
+    }
     uint32_t B2_eff = tile128 ? 128 : 64;
     uint32_t grid_x = (N + 63) / 64;
     uint32_t grid_y = (Co + B2_eff - 1) / B2_eff;
@@ -1503,7 +1720,7 @@ torch::Tensor spconv_fwd_masked_implicit_gemm(
                                         MTLSizeMake(grid_x, grid_y, 1),
                                         MTLSizeMake(256, 1, 1));
     } else {
-        bool tune = gemm_autotune_enabled();
+        bool tune = gemm_autotune_enabled() || autotune_adaptive_enabled();
         auto t0 = tune ? std::chrono::high_resolution_clock::now()
                        : std::chrono::high_resolution_clock::time_point{};
         ctx().dispatch_threadgroups(kernel_name, setup,
@@ -1513,7 +1730,49 @@ torch::Tensor spconv_fwd_masked_implicit_gemm(
         if (tune) {
             auto t1 = std::chrono::high_resolution_clock::now();
             float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
-            g_spconv_timing.record(N, Ci, Co, V, us);
+            if (tile128) g_spconv_timing.record_tile128(N, Ci, Co, V, us);
+            else         g_spconv_timing.record_tile64(N, Ci, Co, V, us);
+        }
+    }
+
+    // Adaptive probe of the other tile (first-time only per shape).
+    if (tile128_eligible && autotune_adaptive_enabled() && !on_mps) {
+        bool missing = g_spconv_timing.needs_probe(N, Ci, Co, V, /*probe_tile128=*/!tile128);
+        if (missing) {
+            bool probe_tile128 = !tile128;
+            uint32_t probe_B2 = probe_tile128 ? 128 : 64;
+            uint32_t probe_grid_y = (Co + probe_B2 - 1) / probe_B2;
+            uint32_t probe_smem = probe_tile128
+                ? gemm_smem_fwd_masked_t128(input.scalar_type())
+                : gemm_smem_fwd_masked(input.scalar_type());
+            std::string probe_kernel = probe_tile128
+                ? std::string("spconv_fwd_masked_implicit_gemm_t128") + gemm_dtype_suffix(input.scalar_type())
+                : std::string("spconv_fwd_masked_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
+            auto probe_setup = [&](id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:buf_input.buffer    offset:buf_input.offset    atIndex:0];
+                [enc setBuffer:buf_weight.buffer   offset:buf_weight.offset   atIndex:1];
+                [enc setBuffer:bias_buf            offset:bias_offset         atIndex:2];
+                [enc setBuffer:buf_neighbor.buffer offset:buf_neighbor.offset atIndex:3];
+                [enc setBuffer:buf_sorted.buffer   offset:buf_sorted.offset   atIndex:4];
+                [enc setBuffer:buf_vk.buffer       offset:buf_vk.offset       atIndex:5];
+                [enc setBuffer:buf_vks.buffer      offset:buf_vks.offset      atIndex:6];
+                [enc setBuffer:out.buffer          offset:out.offset          atIndex:7];
+                [enc setBytes:&N        length:sizeof(N)        atIndex:8];
+                [enc setBytes:&Co       length:sizeof(Co)       atIndex:9];
+                [enc setBytes:&Ci       length:sizeof(Ci)       atIndex:10];
+                [enc setBytes:&V        length:sizeof(V)        atIndex:11];
+                [enc setBytes:&has_bias length:sizeof(has_bias) atIndex:12];
+                [enc setThreadgroupMemoryLength:probe_smem atIndex:0];
+            };
+            auto t0p = std::chrono::high_resolution_clock::now();
+            ctx().dispatch_threadgroups(probe_kernel, probe_setup,
+                                        MTLSizeMake(grid_x, probe_grid_y, 1),
+                                        MTLSizeMake(256, 1, 1),
+                                        /*wait=*/true);
+            auto t1p = std::chrono::high_resolution_clock::now();
+            float us = std::chrono::duration<float, std::micro>(t1p - t0p).count();
+            if (probe_tile128) g_spconv_timing.record_tile128(N, Ci, Co, V, us);
+            else               g_spconv_timing.record_tile64(N, Ci, Co, V, us);
         }
     }
 
@@ -1783,26 +2042,58 @@ torch::Tensor sparse_attention_fwd(
 
     const char* suffix = spconv::gemm_dtype_suffix(q.scalar_type());
 
-    // Two kernel variants in source: the naive per-thread-serial-KV kernel
-    // (default) and a tiled flash-attention-v2 variant with cooperative
-    // K/V-tile loads into threadgroup memory. Measured on M3 Max: the tiled
-    // variant currently regresses at all tested shapes — the per-thread dot
-    // product inside the inner loop forfeits the SIMD matmul benefit that
-    // makes flash-attn fast, and the threadgroup barriers + cooperative
-    // load overhead outweigh the smem sharing for head_dim=64 on Apple
-    // Silicon's cache hierarchy. Kept in source for future profiling work
-    // (switching the inner loop to simdgroup_matrix_multiply_accumulate on
-    // Q@K^T would likely unlock it). Opt in via FLEX_GEMM_ATTN_KERNEL=tiled.
+    // Dispatcher selects between two kernel variants:
+    //   (a) naive per-thread-serial-KV kernel in sparse_attn.metal — one
+    //       thread per (q-row, head, seq), loops over KV serially. Simple,
+    //       correct, no smem usage. Loses asymptotically as max_seqlen grows
+    //       because each K/V row is re-read per Q row.
+    //   (b) flash-attention-v2 tiled kernel in sparse_attn_tiled.metal —
+    //       threadgroup processes a BLOCK_Q-row tile with cooperative K/V
+    //       loads into smem and simdgroup_matrix_multiply_accumulate for both
+    //       Q@K^T and P@V. Wins asymptotically; constant factor dominated by
+    //       load bandwidth at BLOCK_KV=32.
+    //
+    // Gating:
+    //   - flash requires C_q == C_v, both multiples of 8, both <= 64
+    //     (smem budget: fp32/head_dim=64 uses ~28KB of the 32KB limit).
+    //   - FLEX_GEMM_ATTN_KERNEL={naive,tiled} overrides the auto pick.
+    //   - Default: flash whenever the gate is met, else naive.
     const char* env_kernel = std::getenv("FLEX_GEMM_ATTN_KERNEL");
-    bool use_tiled = env_kernel && std::string(env_kernel) == "tiled";
+    bool flash_eligible =
+        (C_q == C_v) && (C_q % 8 == 0) && (C_q <= 64) && (C_q >= 8);
+    bool use_tiled;
+    if (env_kernel && std::string(env_kernel) == "tiled") {
+        use_tiled = flash_eligible;
+    } else if (env_kernel && std::string(env_kernel) == "naive") {
+        use_tiled = false;
+    } else {
+        use_tiled = flash_eligible;
+    }
 
     if (use_tiled) {
-        // Tiled flash-attention: threadgroup of TILES_Q=32, smem K_tile + V_tile.
-        const uint32_t TILES_Q_V = 32;
-        const uint32_t TILES_KV_V = 32;
+        // Flash-v2: BLOCK_Q=16, BLOCK_KV=32, 2 simdgroups (64 threads).
+        // Smem layout (matching kernel):
+        //   smem_q[16,  C_q]  ELEM_T
+        //   smem_k[32,  C_q]  ELEM_T
+        //   smem_v[32,  C_v]  ELEM_T
+        //   smem_s[16,  32]   float
+        //   smem_p[16,  32]   ELEM_T
+        //   smem_o[16,  C_v]  float
+        //   smem_m[16]        float
+        //   smem_l[16]        float
+        const uint32_t FLASH_BLOCK_Q  = 16;
+        const uint32_t FLASH_BLOCK_KV = 32;
+        const uint32_t FLASH_THREADS  = 64;
         size_t elem_bytes = (q.scalar_type() == torch::kFloat32) ? 4 : 2;
-        uint32_t shared_mem = (uint32_t)(TILES_KV_V * C_q * elem_bytes
-                                        + TILES_KV_V * C_v * elem_bytes);
+        uint32_t shared_mem = (uint32_t)(
+              FLASH_BLOCK_Q  * C_q * elem_bytes
+            + FLASH_BLOCK_KV * C_q * elem_bytes
+            + FLASH_BLOCK_KV * C_v * elem_bytes
+            + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * sizeof(float)
+            + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * elem_bytes
+            + FLASH_BLOCK_Q  * C_v * sizeof(float)
+            + FLASH_BLOCK_Q  * 2 * sizeof(float)
+        );
 
         std::string kernel_name = std::string("sparse_attention_tiled_fwd") + suffix;
 
@@ -1820,9 +2111,9 @@ torch::Tensor sparse_attention_fwd(
             [enc setThreadgroupMemoryLength:shared_mem atIndex:0];
         };
 
-        MTLSize tg = MTLSizeMake(TILES_Q_V, 1, 1);
+        MTLSize tg = MTLSizeMake(FLASH_THREADS, 1, 1);
         MTLSize grid_tgs = MTLSizeMake(
-            ((NSUInteger)max_q_seqlen + TILES_Q_V - 1) / TILES_Q_V,
+            ((NSUInteger)max_q_seqlen + FLASH_BLOCK_Q - 1) / FLASH_BLOCK_Q,
             (NSUInteger)H,
             (NSUInteger)N);
 
@@ -1835,7 +2126,7 @@ torch::Tensor sparse_attention_fwd(
         return out.backing;
     }
 
-    // Naive path (default at small max_seqlen).
+    // Naive path (default when flash gate not met).
     std::string kernel_name = std::string("sparse_attention_fwd") + suffix;
 
     auto setup = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1866,6 +2157,269 @@ torch::Tensor sparse_attention_fwd(
     }
 
     return out.backing;
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> sparse_attention_bwd(
+    const torch::Tensor& q,              // [T_q, H, C_q]
+    const torch::Tensor& k,              // [T_kv, H, C_q]
+    const torch::Tensor& v,              // [T_kv, H, C_v]
+    const torch::Tensor& d_out,          // [T_q, H, C_v]
+    const torch::Tensor& cu_seqlens_q,   // [N+1]
+    const torch::Tensor& cu_seqlens_kv,  // [N+1]
+    int64_t max_q_seqlen,
+    int64_t max_kv_seqlen,
+    double scale
+) {
+    bool on_mps = q.device().is_mps();
+
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && d_out.dim() == 3,
+                "sparse_attention_bwd: q/k/v/d_out must be 3-D [T, H, C]");
+    TORCH_CHECK(k.size(0) == v.size(0), "T_kv mismatch between k and v");
+    TORCH_CHECK(q.size(0) == d_out.size(0), "T_q mismatch between q and d_out");
+    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1) &&
+                q.size(1) == d_out.size(1), "H mismatch");
+    TORCH_CHECK(q.size(2) == k.size(2), "C_q mismatch between q and k");
+    TORCH_CHECK(v.size(2) == d_out.size(2), "C_v mismatch between v and d_out");
+
+    int64_t T_q  = q.size(0);
+    int64_t T_kv = k.size(0);
+    int64_t H    = q.size(1);
+    int64_t C_q  = q.size(2);
+    int64_t C_v  = v.size(2);
+    TORCH_CHECK(C_q <= 128 && C_v <= 128,
+                "sparse_attention_bwd: head dim must be <= 128");
+
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() &&
+                q.scalar_type() == v.scalar_type() &&
+                q.scalar_type() == d_out.scalar_type(),
+                "q/k/v/d_out dtype must all match");
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == torch::kInt32 &&
+                cu_seqlens_kv.scalar_type() == torch::kInt32,
+                "cu_seqlens_* must be int32");
+    TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_kv.size(0),
+                "cu_seqlens_q and cu_seqlens_kv must have the same length");
+
+    int64_t N = cu_seqlens_q.size(0) - 1;
+
+    auto buf_q    = from_tensor(q);
+    auto buf_k    = from_tensor(k);
+    auto buf_v    = from_tensor(v);
+    auto buf_do   = from_tensor(d_out);
+    auto buf_csq  = from_tensor(cu_seqlens_q);
+    auto buf_cskv = from_tensor(cu_seqlens_kv);
+
+    auto d_q_out  = make_output({T_q,  H, C_q}, q.scalar_type(), q.device());
+    auto d_k_out  = make_output({T_kv, H, C_q}, q.scalar_type(), q.device());
+    auto d_v_out  = make_output({T_kv, H, C_v}, q.scalar_type(), q.device());
+
+    // Scratch buffers for m, l, D per Q row (fp32 regardless of input dtype).
+    auto f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+    torch::Tensor m_aux = torch::empty({T_q, H}, f32_opts);
+    torch::Tensor l_aux = torch::empty({T_q, H}, f32_opts);
+    torch::Tensor d_aux = torch::empty({T_q, H}, f32_opts);
+    auto buf_m = from_tensor(m_aux);
+    auto buf_l = from_tensor(l_aux);
+    auto buf_d = from_tensor(d_aux);
+
+    uint32_t H_u    = (uint32_t)H;
+    uint32_t Cq_u   = (uint32_t)C_q;
+    uint32_t Cv_u   = (uint32_t)C_v;
+    float scale_f   = (float)scale;
+
+    const char* suffix = spconv::gemm_dtype_suffix(q.scalar_type());
+
+    // Flash-bwd dispatcher — uses simdgroup matmul in bwd_dq + bwd_dkdv. Gates:
+    //   - head dims satisfy the fwd-flash gate (C_q == C_v, multiple of 8, ≤ 64).
+    //   - all dtypes supported (fp32/fp16/bf16). Round-6 fix in bwd_dq reordered
+    //     the aux-to-global flush to occur before the dQ spill, which otherwise
+    //     overran smem_p into smem_m/l/D at fp16/bf16 (smem_s+smem_p = 3KB at
+    //     fp16 vs 4KB at fp32, while the spill is always 4KB).
+    //   - FLEX_GEMM_ATTN_BWD_KERNEL={flash,naive} env override for A/B.
+    const char* env_bwd = std::getenv("FLEX_GEMM_ATTN_BWD_KERNEL");
+    bool flash_eligible =
+        (C_q == C_v) && (C_q % 8 == 0) && (C_q <= 64) && (C_q >= 8);
+    bool use_flash;
+    if (env_bwd && std::string(env_bwd) == "flash") use_flash = flash_eligible;
+    else if (env_bwd && std::string(env_bwd) == "naive") use_flash = false;
+    else use_flash = flash_eligible;
+
+    if (use_flash) {
+        // Flash bwd_dq: grid (cdiv(max_q_seqlen, BLOCK_Q), H, N), tg=64 threads.
+        const uint32_t FLASH_BLOCK_Q = 16;
+        const uint32_t FLASH_BLOCK_KV = 32;
+        const uint32_t FLASH_BLOCK_KV_K = 16;
+        const uint32_t FLASH_BLOCK_Q_K = 32;
+        const uint32_t FLASH_THREADS = 64;
+        size_t eb = (q.scalar_type() == torch::kFloat32) ? 4 : 2;
+
+        // bwd_dq smem: Q + dO + K + V + S + P + m/l/D
+        uint32_t smem_dq = (uint32_t)(
+              FLASH_BLOCK_Q  * C_q * eb
+            + FLASH_BLOCK_Q  * C_v * eb
+            + FLASH_BLOCK_KV * C_q * eb
+            + FLASH_BLOCK_KV * C_v * eb
+            + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * sizeof(float)
+            + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * eb
+            + FLASH_BLOCK_Q  * 3 * sizeof(float)
+        );
+        // Scratch for dQ spill uses smem_s+smem_p combined (needs BLOCK_Q*C_q floats).
+        // Ensure allocation includes this bigger buffer at the smem_s slot so the
+        // cast write works. Take max of the Q@K^T working size and the dQ-spill size.
+        uint32_t smem_dq_scratch = (uint32_t)(FLASH_BLOCK_Q * C_q * sizeof(float));
+        uint32_t smem_dq_base_no_scratch = (uint32_t)(
+              FLASH_BLOCK_Q  * C_q * eb
+            + FLASH_BLOCK_Q  * C_v * eb
+            + FLASH_BLOCK_KV * C_q * eb
+            + FLASH_BLOCK_KV * C_v * eb
+            + FLASH_BLOCK_Q  * 3 * sizeof(float)
+        );
+        uint32_t smem_dq_working =
+              (uint32_t)(FLASH_BLOCK_Q * FLASH_BLOCK_KV * sizeof(float))
+            + (uint32_t)(FLASH_BLOCK_Q * FLASH_BLOCK_KV * eb);
+        uint32_t smem_dq_final = smem_dq_base_no_scratch
+            + std::max<uint32_t>(smem_dq_working, smem_dq_scratch);
+        (void)smem_dq;
+
+        std::string kn_dq = std::string("sparse_attention_bwd_dq_flash") + suffix;
+        auto setup_dq = [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:buf_q.buffer    offset:buf_q.offset    atIndex:0];
+            [enc setBuffer:buf_k.buffer    offset:buf_k.offset    atIndex:1];
+            [enc setBuffer:buf_v.buffer    offset:buf_v.offset    atIndex:2];
+            [enc setBuffer:buf_do.buffer   offset:buf_do.offset   atIndex:3];
+            [enc setBuffer:buf_csq.buffer  offset:buf_csq.offset  atIndex:4];
+            [enc setBuffer:buf_cskv.buffer offset:buf_cskv.offset atIndex:5];
+            [enc setBuffer:d_q_out.buffer  offset:d_q_out.offset  atIndex:6];
+            [enc setBuffer:buf_m.buffer    offset:buf_m.offset    atIndex:7];
+            [enc setBuffer:buf_l.buffer    offset:buf_l.offset    atIndex:8];
+            [enc setBuffer:buf_d.buffer    offset:buf_d.offset    atIndex:9];
+            [enc setBytes:&H_u     length:sizeof(H_u)     atIndex:10];
+            [enc setBytes:&Cq_u    length:sizeof(Cq_u)    atIndex:11];
+            [enc setBytes:&Cv_u    length:sizeof(Cv_u)    atIndex:12];
+            [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:13];
+            [enc setThreadgroupMemoryLength:smem_dq_final atIndex:0];
+        };
+        MTLSize tg_dq = MTLSizeMake(FLASH_THREADS, 1, 1);
+        MTLSize grid_dq = MTLSizeMake(
+            ((NSUInteger)max_q_seqlen + FLASH_BLOCK_Q - 1) / FLASH_BLOCK_Q,
+            (NSUInteger)H, (NSUInteger)N);
+
+        // bwd_dkdv smem:
+        //   K + V + Q + dO + [S + P + PT combined, max of working & spill] + m/l/D.
+        // Working (during loop): S + P + PT. Spill (for dV/dK write): BLOCK_KV_K *
+        // max(C_q, C_v) fp32. smem_pT avoids the fp16 transpose-load that was
+        // numerically wrong in the original dV/dK matmuls.
+        uint32_t smem_dkdv_working =
+              (uint32_t)(FLASH_BLOCK_Q_K * FLASH_BLOCK_KV_K * sizeof(float))
+            + (uint32_t)(FLASH_BLOCK_Q_K * FLASH_BLOCK_KV_K * eb)
+            + (uint32_t)(FLASH_BLOCK_KV_K * FLASH_BLOCK_Q_K * eb);
+        uint32_t smem_dkdv_spill = (uint32_t)(
+              FLASH_BLOCK_KV_K * std::max<uint32_t>((uint32_t)C_q, (uint32_t)C_v) * sizeof(float)
+        );
+        uint32_t smem_dkdv_base = (uint32_t)(
+              FLASH_BLOCK_KV_K * C_q * eb
+            + FLASH_BLOCK_KV_K * C_v * eb
+            + FLASH_BLOCK_Q_K  * C_q * eb
+            + FLASH_BLOCK_Q_K  * C_v * eb
+            + FLASH_BLOCK_Q_K  * 3 * sizeof(float)
+        );
+        uint32_t smem_dkdv = smem_dkdv_base
+            + std::max<uint32_t>(smem_dkdv_working, smem_dkdv_spill);
+
+        std::string kn_dkdv = std::string("sparse_attention_bwd_dkdv_flash") + suffix;
+        auto setup_dkdv = [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:buf_q.buffer    offset:buf_q.offset    atIndex:0];
+            [enc setBuffer:buf_k.buffer    offset:buf_k.offset    atIndex:1];
+            [enc setBuffer:buf_v.buffer    offset:buf_v.offset    atIndex:2];
+            [enc setBuffer:buf_do.buffer   offset:buf_do.offset   atIndex:3];
+            [enc setBuffer:buf_csq.buffer  offset:buf_csq.offset  atIndex:4];
+            [enc setBuffer:buf_cskv.buffer offset:buf_cskv.offset atIndex:5];
+            [enc setBuffer:buf_m.buffer    offset:buf_m.offset    atIndex:6];
+            [enc setBuffer:buf_l.buffer    offset:buf_l.offset    atIndex:7];
+            [enc setBuffer:buf_d.buffer    offset:buf_d.offset    atIndex:8];
+            [enc setBuffer:d_k_out.buffer  offset:d_k_out.offset  atIndex:9];
+            [enc setBuffer:d_v_out.buffer  offset:d_v_out.offset  atIndex:10];
+            [enc setBytes:&H_u     length:sizeof(H_u)     atIndex:11];
+            [enc setBytes:&Cq_u    length:sizeof(Cq_u)    atIndex:12];
+            [enc setBytes:&Cv_u    length:sizeof(Cv_u)    atIndex:13];
+            [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:14];
+            [enc setThreadgroupMemoryLength:smem_dkdv atIndex:0];
+        };
+        MTLSize tg_dkdv = MTLSizeMake(FLASH_THREADS, 1, 1);
+        MTLSize grid_dkdv = MTLSizeMake(
+            ((NSUInteger)max_kv_seqlen + FLASH_BLOCK_KV_K - 1) / FLASH_BLOCK_KV_K,
+            (NSUInteger)H, (NSUInteger)N);
+
+        if (on_mps) {
+            ctx().dispatch_threadgroups_mps(kn_dq,   setup_dq,   grid_dq,   tg_dq);
+            ctx().dispatch_threadgroups_mps(kn_dkdv, setup_dkdv, grid_dkdv, tg_dkdv);
+        } else {
+            ctx().dispatch_threadgroups(kn_dq,   setup_dq,   grid_dq,   tg_dq,   /*wait=*/false);
+            ctx().dispatch_threadgroups(kn_dkdv, setup_dkdv, grid_dkdv, tg_dkdv, /*wait=*/true);
+        }
+        return std::make_tuple(d_q_out.backing, d_k_out.backing, d_v_out.backing);
+    }
+
+    // ------- Naive bwd path (kept as fallback for non-flash-eligible shapes) -------
+    std::string kn_q = std::string("sparse_attention_bwd_q") + suffix;
+    auto setup_q = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buf_q.buffer    offset:buf_q.offset    atIndex:0];
+        [enc setBuffer:buf_k.buffer    offset:buf_k.offset    atIndex:1];
+        [enc setBuffer:buf_v.buffer    offset:buf_v.offset    atIndex:2];
+        [enc setBuffer:buf_do.buffer   offset:buf_do.offset   atIndex:3];
+        [enc setBuffer:buf_csq.buffer  offset:buf_csq.offset  atIndex:4];
+        [enc setBuffer:buf_cskv.buffer offset:buf_cskv.offset atIndex:5];
+        [enc setBuffer:d_q_out.buffer  offset:d_q_out.offset  atIndex:6];
+        [enc setBuffer:buf_m.buffer    offset:buf_m.offset    atIndex:7];
+        [enc setBuffer:buf_l.buffer    offset:buf_l.offset    atIndex:8];
+        [enc setBuffer:buf_d.buffer    offset:buf_d.offset    atIndex:9];
+        [enc setBytes:&H_u     length:sizeof(H_u)     atIndex:10];
+        [enc setBytes:&Cq_u    length:sizeof(Cq_u)    atIndex:11];
+        [enc setBytes:&Cv_u    length:sizeof(Cv_u)    atIndex:12];
+        [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:13];
+    };
+    NSUInteger tg_q_x = std::min((NSUInteger)32,
+                                 (NSUInteger)std::max<int64_t>(max_q_seqlen, 1));
+    MTLSize tg_q = MTLSizeMake(tg_q_x, 1, 1);
+    MTLSize grid_q = MTLSizeMake(
+        ((NSUInteger)max_q_seqlen + tg_q_x - 1) / tg_q_x,
+        (NSUInteger)H, (NSUInteger)N);
+
+    std::string kn_kv = std::string("sparse_attention_bwd_kv") + suffix;
+    auto setup_kv = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buf_q.buffer    offset:buf_q.offset    atIndex:0];
+        [enc setBuffer:buf_k.buffer    offset:buf_k.offset    atIndex:1];
+        [enc setBuffer:buf_v.buffer    offset:buf_v.offset    atIndex:2];
+        [enc setBuffer:buf_do.buffer   offset:buf_do.offset   atIndex:3];
+        [enc setBuffer:buf_csq.buffer  offset:buf_csq.offset  atIndex:4];
+        [enc setBuffer:buf_cskv.buffer offset:buf_cskv.offset atIndex:5];
+        [enc setBuffer:buf_m.buffer    offset:buf_m.offset    atIndex:6];
+        [enc setBuffer:buf_l.buffer    offset:buf_l.offset    atIndex:7];
+        [enc setBuffer:buf_d.buffer    offset:buf_d.offset    atIndex:8];
+        [enc setBuffer:d_k_out.buffer  offset:d_k_out.offset  atIndex:9];
+        [enc setBuffer:d_v_out.buffer  offset:d_v_out.offset  atIndex:10];
+        [enc setBytes:&H_u     length:sizeof(H_u)     atIndex:11];
+        [enc setBytes:&Cq_u    length:sizeof(Cq_u)    atIndex:12];
+        [enc setBytes:&Cv_u    length:sizeof(Cv_u)    atIndex:13];
+        [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:14];
+    };
+    NSUInteger tg_kv_x = std::min((NSUInteger)32,
+                                  (NSUInteger)std::max<int64_t>(max_kv_seqlen, 1));
+    MTLSize tg_kv = MTLSizeMake(tg_kv_x, 1, 1);
+    MTLSize grid_kv = MTLSizeMake(
+        ((NSUInteger)max_kv_seqlen + tg_kv_x - 1) / tg_kv_x,
+        (NSUInteger)H, (NSUInteger)N);
+
+    if (on_mps) {
+        ctx().dispatch_threadgroups_mps(kn_q,  setup_q,  grid_q,  tg_q);
+        ctx().dispatch_threadgroups_mps(kn_kv, setup_kv, grid_kv, tg_kv);
+    } else {
+        ctx().dispatch_threadgroups(kn_q,  setup_q,  grid_q,  tg_q,
+                                    /*wait=*/false);
+        ctx().dispatch_threadgroups(kn_kv, setup_kv, grid_kv, tg_kv,
+                                    /*wait=*/true);
+    }
+
+    return std::make_tuple(d_q_out.backing, d_k_out.backing, d_v_out.backing);
 }
 
 } // namespace sparse_attn
@@ -1908,20 +2462,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("spconv_bwd_implicit_gemm", &spconv::spconv_bwd_implicit_gemm);
     m.def("spconv_bwd_masked_implicit_gemm", &spconv::spconv_bwd_masked_implicit_gemm);
 
-    // Sparse attention (1)
+    // Sparse attention (2)
     m.def("sparse_attention_fwd", &sparse_attn::sparse_attention_fwd);
+    m.def("sparse_attention_bwd", &sparse_attn::sparse_attention_bwd);
 
     // Autotune timing cache query
     m.def("spconv_get_timing_cache", []() {
         std::lock_guard<std::mutex> lock(g_spconv_timing.mu);
         py::dict result;
-        for (auto& [k, v] : g_spconv_timing.cache) {
+        for (auto& [k, entry] : g_spconv_timing.cache) {
             uint32_t nb  = (k >> 48) & 0xFFFF;
             uint32_t ci  = (k >> 32) & 0xFFFF;
             uint32_t co  = (k >> 16) & 0xFFFF;
             uint32_t vol = k & 0xFFFF;
             auto key_str = std::to_string(nb) + "x" + std::to_string(ci) + "x" +
                            std::to_string(co) + "x" + std::to_string(vol);
+            py::dict v;
+            v["us_tile64"]  = entry.us_tile64;
+            v["us_tile128"] = entry.us_tile128;
             result[py::cast(key_str)] = v;
         }
         return result;
@@ -1930,4 +2488,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         std::lock_guard<std::mutex> lock(g_spconv_timing.mu);
         g_spconv_timing.cache.clear();
     });
+    m.def("spconv_autotune_save", []() { g_spconv_timing.save(); });
+    m.def("spconv_autotune_load", []() { g_spconv_timing.load(); });
+    m.def("spconv_autotune_cache_path", []() { return autotune_cache_path(); });
+
+    // Register atexit hook so the JSON cache is flushed on process exit even
+    // when no FLEX_GEMM_AUTOTUNE_ADAPTIVE reads saved it midstream.
+    try {
+        py::module_ atexit_mod = py::module_::import("atexit");
+        py::cpp_function save_cb([]() { g_spconv_timing.save(); });
+        atexit_mod.attr("register")(save_cb);
+    } catch (...) {
+        // Non-fatal — persistence just won't happen on exit.
+    }
 }
