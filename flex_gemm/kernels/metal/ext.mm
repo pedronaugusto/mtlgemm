@@ -1724,6 +1724,101 @@ std::tuple<torch::Tensor, torch::Tensor> spconv_bwd_masked_implicit_gemm(
 
 } // namespace spconv
 
+// ============================================================================
+// Fused variable-length sparse attention forward
+// ============================================================================
+namespace sparse_attn {
+
+torch::Tensor sparse_attention_fwd(
+    const torch::Tensor& q,              // [T_q, H, C_q]
+    const torch::Tensor& k,              // [T_kv, H, C_q]
+    const torch::Tensor& v,              // [T_kv, H, C_v]
+    const torch::Tensor& cu_seqlens_q,   // [N+1]
+    const torch::Tensor& cu_seqlens_kv,  // [N+1]
+    int64_t max_q_seqlen,
+    int64_t max_kv_seqlen,
+    double scale
+) {
+    (void)max_kv_seqlen;  // informational; not currently used in the kernel
+
+    bool on_mps = q.device().is_mps();
+
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3,
+                "sparse_attention_fwd: q/k/v must be 3-D [T, H, C]");
+    TORCH_CHECK(k.size(0) == v.size(0), "T_kv mismatch between k and v");
+    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1),
+                "H mismatch across q/k/v");
+    TORCH_CHECK(q.size(2) == k.size(2),
+                "C_q mismatch between q and k");
+
+    int64_t T_q  = q.size(0);
+    int64_t H    = q.size(1);
+    int64_t C_q  = q.size(2);
+    int64_t C_v  = v.size(2);
+    TORCH_CHECK(C_q <= 128 && C_v <= 128,
+                "sparse_attention_fwd: head dim must be <= 128 (C_q=", C_q,
+                ", C_v=", C_v, ")");
+
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
+                "q/k/v dtype must all match");
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == torch::kInt32 &&
+                cu_seqlens_kv.scalar_type() == torch::kInt32,
+                "cu_seqlens_* must be int32");
+    TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_kv.size(0),
+                "cu_seqlens_q and cu_seqlens_kv must have the same length");
+
+    int64_t N = cu_seqlens_q.size(0) - 1;
+
+    auto buf_q   = from_tensor(q);
+    auto buf_k   = from_tensor(k);
+    auto buf_v   = from_tensor(v);
+    auto buf_csq = from_tensor(cu_seqlens_q);
+    auto buf_cskv = from_tensor(cu_seqlens_kv);
+    auto out = make_output({T_q, H, C_v}, q.scalar_type(), q.device());
+
+    uint32_t H_u = (uint32_t)H;
+    uint32_t Cq_u = (uint32_t)C_q;
+    uint32_t Cv_u = (uint32_t)C_v;
+    float scale_f = (float)scale;
+
+    const char* suffix = spconv::gemm_dtype_suffix(q.scalar_type());
+    std::string kernel_name = std::string("sparse_attention_fwd") + suffix;
+
+    auto setup = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buf_q.buffer    offset:buf_q.offset    atIndex:0];
+        [enc setBuffer:buf_k.buffer    offset:buf_k.offset    atIndex:1];
+        [enc setBuffer:buf_v.buffer    offset:buf_v.offset    atIndex:2];
+        [enc setBuffer:buf_csq.buffer  offset:buf_csq.offset  atIndex:3];
+        [enc setBuffer:buf_cskv.buffer offset:buf_cskv.offset atIndex:4];
+        [enc setBuffer:out.buffer      offset:out.offset      atIndex:5];
+        [enc setBytes:&H_u     length:sizeof(H_u)     atIndex:6];
+        [enc setBytes:&Cq_u    length:sizeof(Cq_u)    atIndex:7];
+        [enc setBytes:&Cv_u    length:sizeof(Cv_u)    atIndex:8];
+        [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:9];
+    };
+
+    // Grid: (max_q_seqlen, H, N). Threadgroup: 32 threads in x dimension, 1
+    // head per tg. Threads beyond the per-sequence q_len early-exit inside
+    // the kernel.
+    NSUInteger tg_x = std::min((NSUInteger)32, (NSUInteger)std::max<int64_t>(max_q_seqlen, 1));
+    MTLSize tg = MTLSizeMake(tg_x, 1, 1);
+    MTLSize grid_tgs = MTLSizeMake(
+        ((NSUInteger)max_q_seqlen + tg_x - 1) / tg_x,
+        (NSUInteger)H,
+        (NSUInteger)N);
+
+    if (on_mps) {
+        ctx().dispatch_threadgroups_mps(kernel_name, setup, grid_tgs, tg);
+    } else {
+        ctx().dispatch_threadgroups(kernel_name, setup, grid_tgs, tg,
+                                    /*wait=*/true);
+    }
+
+    return out.backing;
+}
+
+} // namespace sparse_attn
+
 } // namespace metal
 } // namespace flex_gemm
 
@@ -1761,6 +1856,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("spconv_fwd_masked_implicit_gemm", &spconv::spconv_fwd_masked_implicit_gemm);
     m.def("spconv_bwd_implicit_gemm", &spconv::spconv_bwd_implicit_gemm);
     m.def("spconv_bwd_masked_implicit_gemm", &spconv::spconv_bwd_masked_implicit_gemm);
+
+    // Sparse attention (1)
+    m.def("sparse_attention_fwd", &sparse_attn::sparse_attention_fwd);
 
     // Autotune timing cache query
     m.def("spconv_get_timing_cache", []() {

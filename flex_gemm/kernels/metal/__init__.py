@@ -155,3 +155,30 @@ def sparse_submanifold_conv_bwd_masked_implicit_gemm(grad_output, input, weight,
 
 sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk = sparse_submanifold_conv_fwd_masked_implicit_gemm
 sparse_submanifold_conv_bwd_masked_implicit_gemm_splitk = sparse_submanifold_conv_bwd_masked_implicit_gemm
+
+
+# ============================================================================
+# Sparse attention (1 function) — fused variable-length attention
+# ============================================================================
+
+def sparse_attention_fwd(q, k, v, cu_seqlens_q, cu_seqlens_kv,
+                         max_q_seqlen, max_kv_seqlen, scale):
+    """Fused variable-length sparse attention forward.
+
+    Args:
+        q: [T_q, H, C_q] packed fp32/fp16/bf16 tensor.
+        k: [T_kv, H, C_q] packed tensor (same dtype as q).
+        v: [T_kv, H, C_v] packed tensor.
+        cu_seqlens_q: [N+1] int32 prefix sum of per-sequence q lengths.
+        cu_seqlens_kv: [N+1] int32 prefix sum of per-sequence kv lengths.
+        max_q_seqlen, max_kv_seqlen: ints, per-batch maxima.
+        scale: float, typically 1/sqrt(C_q).
+
+    Returns:
+        [T_q, H, C_v] tensor, same dtype + device as q.
+    """
+    return _C.sparse_attention_fwd(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        cu_seqlens_q.contiguous(), cu_seqlens_kv.contiguous(),
+        int(max_q_seqlen), int(max_kv_seqlen), float(scale),
+    )
