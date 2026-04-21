@@ -51,7 +51,12 @@ TOLERANCES = {
 
 @needs_mps
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("res,ch", [(16, 32), (16, 64), (32, 64), (32, 128), (64, 64)])
+@pytest.mark.parametrize("res,ch", [
+    # Narrow tile (B2=64) regime
+    (16, 32), (16, 64), (32, 64), (64, 64),
+    # Wide-tile (B2=128) regime — exercises the tile128 kernel for ch>=128
+    (32, 128), (32, 256), (64, 128), (64, 256),
+])
 def test_masked_matches_dense(res, ch, dtype):
     torch.manual_seed(0xC0FFEE ^ res ^ (ch << 4))
     device = "mps"

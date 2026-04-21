@@ -1177,6 +1177,13 @@ static uint32_t gemm_smem_fwd_masked(torch::ScalarType dtype) {
     return base + (uint32_t)(64 * 64 * sizeof(float));
 }
 
+// Wide-tile (B2=128) kernels exist in spconv_gemm.metal but are currently
+// unused — measurement on M4 Pro showed the wider tile *regressed* perf at
+// trellis2 shapes (e.g. res=32 ch=128 went from 0.50ms to 0.67ms with tile128).
+// Apple Silicon's scheduling appears to prefer many narrow tiles over few wide
+// ones for this workload, contrary to the typical NVIDIA pattern. The kernel
+// sources are retained for future profiling work — tracked in FOLLOWUPS.md.
+
 // Threadgroup memory bytes for bwd_weight (no smem_nb in this kernel).
 static uint32_t gemm_smem_bwd_weight(torch::ScalarType dtype) {
     size_t es = gemm_elem_bytes(dtype);
@@ -1236,7 +1243,9 @@ torch::Tensor spconv_fwd_implicit_gemm(
     }
     uint32_t has_bias = (bias.numel() > 0) ? 1 : 0;
 
-    // Grid: (cdiv(N, 64), cdiv(Co, 64)), Threadgroup: 256
+    // Grid: (cdiv(N, 64), cdiv(Co, 64)), Threadgroup: 256.
+    // (A wide-tile B2=128 variant exists in the .metal file but is currently
+    // disabled — see use_tile128() above for the rationale.)
     uint32_t grid_x = (N + 63) / 64;
     uint32_t grid_y = (Co + 63) / 64;
     uint32_t shared_mem = gemm_smem_fwd_input(input.scalar_type());
