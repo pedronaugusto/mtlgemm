@@ -1160,6 +1160,23 @@ static uint32_t gemm_smem_fwd_input(torch::ScalarType dtype) {
     return base + (uint32_t)(64 * 64 * sizeof(float));
 }
 
+// Threadgroup memory bytes for masked fwd. Layout adds smem_sorted (B1 ints)
+// in place of the skip-empty-V atomic flag.
+//   float32: smem_a + smem_b + smem_nb + smem_sorted (output reuses smem_a buffer)
+//   half/bfloat: smem_a + smem_b + smem_nb + smem_sorted + smem_out (separate fp32 scratch)
+static uint32_t gemm_smem_fwd_masked(torch::ScalarType dtype) {
+    size_t es = gemm_elem_bytes(dtype);
+    uint32_t base = (uint32_t)(64 * 32 * es + 32 * 64 * es
+                               + 64 * sizeof(uint32_t)
+                               + 64 * sizeof(int32_t));
+    if (dtype == torch::kFloat32) {
+        return (uint32_t)((64 * 32 + 32 * 64) * sizeof(float)
+                          + 64 * sizeof(uint32_t)
+                          + 64 * sizeof(int32_t));
+    }
+    return base + (uint32_t)(64 * 64 * sizeof(float));
+}
+
 // Threadgroup memory bytes for bwd_weight (no smem_nb in this kernel).
 static uint32_t gemm_smem_bwd_weight(torch::ScalarType dtype) {
     size_t es = gemm_elem_bytes(dtype);
@@ -1251,6 +1268,105 @@ torch::Tensor spconv_fwd_implicit_gemm(
         // CPU path: the output tensor's storage must be valid the moment we
         // return — there is no MPS scheduler to defer reads. Always wait.
         // FLEX_GEMM_AUTOTUNE=1 additionally records wall-clock timing.
+        bool tune = gemm_autotune_enabled();
+        auto t0 = tune ? std::chrono::high_resolution_clock::now()
+                       : std::chrono::high_resolution_clock::time_point{};
+        ctx().dispatch_threadgroups(kernel_name, setup,
+                                    MTLSizeMake(grid_x, grid_y, 1),
+                                    MTLSizeMake(256, 1, 1),
+                                    /*wait=*/true);
+        if (tune) {
+            auto t1 = std::chrono::high_resolution_clock::now();
+            float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
+            g_spconv_timing.record(N, Ci, Co, V, us);
+        }
+    }
+
+    return out.backing;
+}
+
+// Masked implicit GEMM forward — uses precomputed sorted_idx + valid_kernel
+// + valid_kernel_seg to iterate only the valid V positions per n-block.
+torch::Tensor spconv_fwd_masked_implicit_gemm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& neighbor,
+    const torch::Tensor& sorted_idx_i64,
+    const torch::Tensor& valid_kernel,
+    const torch::Tensor& valid_kernel_seg
+) {
+    bool on_mps = input.device().is_mps();
+    uint32_t N  = (uint32_t)input.size(0);
+    uint32_t Ci = (uint32_t)input.size(1);
+    uint32_t Co = (uint32_t)weight.size(0);
+    uint32_t V  = (uint32_t)weight.size(1);
+
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
+                "spconv_fwd_masked_implicit_gemm: weight dtype must match input");
+    if (bias.numel() > 0) {
+        TORCH_CHECK(bias.scalar_type() == input.scalar_type(),
+                    "spconv_fwd_masked_implicit_gemm: bias dtype must match input");
+    }
+    TORCH_CHECK(valid_kernel.scalar_type() == torch::kInt32,
+                "valid_kernel must be int32");
+    TORCH_CHECK(valid_kernel_seg.scalar_type() == torch::kInt32,
+                "valid_kernel_seg must be int32");
+
+    // sorted_idx is the int64 result of torch::argsort. Metal kernels read int32,
+    // so cast once here. The values are row indices in [0, N) — fit comfortably.
+    auto sorted_idx_i32 = sorted_idx_i64.scalar_type() == torch::kInt32
+        ? sorted_idx_i64
+        : sorted_idx_i64.to(torch::kInt32);
+
+    auto buf_input    = from_tensor(input);
+    auto buf_weight   = from_tensor(weight);
+    auto buf_neighbor = from_tensor(neighbor);
+    auto buf_sorted   = from_tensor(sorted_idx_i32);
+    auto buf_vk       = from_tensor(valid_kernel);
+    auto buf_vks      = from_tensor(valid_kernel_seg);
+    auto out = make_output({(int64_t)N, (int64_t)Co}, input.scalar_type(), input.device());
+
+    TensorBuffer buf_bias_tb;
+    id<MTLBuffer> bias_buf;
+    NSUInteger bias_offset = 0;
+    if (bias.numel() > 0) {
+        buf_bias_tb = from_tensor(bias);
+        bias_buf = buf_bias_tb.buffer;
+        bias_offset = buf_bias_tb.offset;
+    } else {
+        bias_buf = alloc(4);
+    }
+    uint32_t has_bias = (bias.numel() > 0) ? 1 : 0;
+
+    uint32_t grid_x = (N + 63) / 64;
+    uint32_t grid_y = (Co + 63) / 64;
+    uint32_t shared_mem = gemm_smem_fwd_masked(input.scalar_type());
+
+    std::string kernel_name = std::string("spconv_fwd_masked_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
+
+    auto setup = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buf_input.buffer    offset:buf_input.offset    atIndex:0];
+        [enc setBuffer:buf_weight.buffer   offset:buf_weight.offset   atIndex:1];
+        [enc setBuffer:bias_buf            offset:bias_offset         atIndex:2];
+        [enc setBuffer:buf_neighbor.buffer offset:buf_neighbor.offset atIndex:3];
+        [enc setBuffer:buf_sorted.buffer   offset:buf_sorted.offset   atIndex:4];
+        [enc setBuffer:buf_vk.buffer       offset:buf_vk.offset       atIndex:5];
+        [enc setBuffer:buf_vks.buffer      offset:buf_vks.offset      atIndex:6];
+        [enc setBuffer:out.buffer          offset:out.offset          atIndex:7];
+        [enc setBytes:&N        length:sizeof(N)        atIndex:8];
+        [enc setBytes:&Co       length:sizeof(Co)       atIndex:9];
+        [enc setBytes:&Ci       length:sizeof(Ci)       atIndex:10];
+        [enc setBytes:&V        length:sizeof(V)        atIndex:11];
+        [enc setBytes:&has_bias length:sizeof(has_bias) atIndex:12];
+        [enc setThreadgroupMemoryLength:shared_mem atIndex:0];
+    };
+
+    if (on_mps) {
+        ctx().dispatch_threadgroups_mps(kernel_name, setup,
+                                        MTLSizeMake(grid_x, grid_y, 1),
+                                        MTLSizeMake(256, 1, 1));
+    } else {
         bool tune = gemm_autotune_enabled();
         auto t0 = tune ? std::chrono::high_resolution_clock::now()
                        : std::chrono::high_resolution_clock::time_point{};
@@ -1390,6 +1506,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("neighbor_map_post_process_for_masked_implicit_gemm_1", &spconv::neighbor_map_post_process_for_masked_implicit_gemm_1);
     m.def("neighbor_map_post_process_for_masked_implicit_gemm_2", &spconv::neighbor_map_post_process_for_masked_implicit_gemm_2);
     m.def("spconv_fwd_implicit_gemm", &spconv::spconv_fwd_implicit_gemm);
+    m.def("spconv_fwd_masked_implicit_gemm", &spconv::spconv_fwd_masked_implicit_gemm);
     m.def("spconv_bwd_implicit_gemm", &spconv::spconv_bwd_implicit_gemm);
 
     // Autotune timing cache query

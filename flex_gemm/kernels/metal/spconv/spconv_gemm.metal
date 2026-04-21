@@ -666,3 +666,240 @@ SPCONV_BWD_INPUT_KERNEL(spconv_bwd_input_implicit_gemm_bfloat, bfloat)
 
 SPCONV_BWD_WEIGHT_KERNEL(spconv_bwd_weight_implicit_gemm_half, half)
 SPCONV_BWD_WEIGHT_KERNEL(spconv_bwd_weight_implicit_gemm_bfloat, bfloat)
+
+// ============================================================================
+// Masked implicit GEMM forward — iterates only the valid V positions per
+// n-block using the precomputed sorted_idx / valid_kernel / valid_kernel_seg
+// machinery. Same simdgroup tiling as the dense kernel; the wins are:
+//   - V loop bound = valid_kernel_seg[n_block+1] - valid_kernel_seg[n_block]
+//     (often << V on sparse data)
+//   - sorted_idx groups rows that share their valid V positions, so each block
+//     wastes fewer iterations on rows that don't need them.
+//
+// Output is written at sorted_idx[row] positions, NOT at the dense block row,
+// so we read sorted_idx into smem once and reuse across the V loop and the
+// store-back loop.
+//
+// Smem layout (half/bfloat):
+//   smem_a[B1][BK] | smem_b[BK][B2] | smem_nb[B1] | smem_sorted[B1] | smem_out[B1][B2]
+//   = 4096 + 4096 + 256 + 256 + 16384 = 25088 bytes
+//
+// Smem layout (float32, output reuses smem_a+smem_b region):
+//   smem_a+smem_b[16384 bytes] | smem_nb[256] | smem_sorted[256] = 16896 bytes
+// ============================================================================
+
+#define SPCONV_FWD_MASKED_KERNEL(NAME, ELEM_T)                                             \
+kernel void NAME(                                                                          \
+    const device ELEM_T* input            [[buffer(0)]],                                   \
+    const device ELEM_T* weight           [[buffer(1)]],                                   \
+    const device ELEM_T* bias             [[buffer(2)]],                                   \
+    const device uint*   neighbor         [[buffer(3)]],                                   \
+    const device int*    sorted_idx       [[buffer(4)]],                                   \
+    const device int*    valid_kernel     [[buffer(5)]],                                   \
+    const device int*    valid_kernel_seg [[buffer(6)]],                                   \
+    device       ELEM_T* output           [[buffer(7)]],                                   \
+    constant     uint&   N                [[buffer(8)]],                                   \
+    constant     uint&   Co               [[buffer(9)]],                                   \
+    constant     uint&   Ci               [[buffer(10)]],                                  \
+    constant     uint&   V                [[buffer(11)]],                                  \
+    constant     uint&   has_bias         [[buffer(12)]],                                  \
+    threadgroup  uchar*  smem_raw         [[threadgroup(0)]],                              \
+    uint2 gid   [[threadgroup_position_in_grid]],                                          \
+    uint  lid   [[thread_index_in_threadgroup]],                                           \
+    uint  simd_id  [[simdgroup_index_in_threadgroup]],                                     \
+    uint  lane_id  [[thread_index_in_simdgroup]]                                           \
+) {                                                                                        \
+    uint n_block_idx = gid.x;                                                              \
+    uint n_base   = n_block_idx * B1;                                                      \
+    uint co_base  = gid.y * B2;                                                            \
+    uint threads  = GEMM_THREADS;                                                          \
+                                                                                           \
+    threadgroup ELEM_T* smem_a    = (threadgroup ELEM_T*)smem_raw;                         \
+    threadgroup ELEM_T* smem_b    = smem_a + B1 * BK;                                      \
+    threadgroup uint*   smem_nb   = (threadgroup uint*)(smem_b + BK * B2);                 \
+    threadgroup int*    smem_sorted = (threadgroup int*)(smem_nb + B1);                    \
+    threadgroup float*  smem_out  = (threadgroup float*)(smem_sorted + B1);                \
+                                                                                           \
+    /* Load sorted row indices for this n-block once. -1 marks past-end rows. */          \
+    for (uint i = lid; i < B1; i += threads) {                                             \
+        uint n = n_base + i;                                                               \
+        smem_sorted[i] = (n < N) ? sorted_idx[n] : -1;                                     \
+    }                                                                                      \
+                                                                                           \
+    uint vps_start = (uint)valid_kernel_seg[n_block_idx];                                  \
+    uint vps_end   = (uint)valid_kernel_seg[n_block_idx + 1];                              \
+                                                                                           \
+    simdgroup_matrix<float, 8, 8> acc[TILES_N];                                            \
+    for (uint i = 0; i < TILES_N; i++)                                                     \
+        acc[i] = simdgroup_matrix<float, 8, 8>(0.0f);                                      \
+                                                                                           \
+    threadgroup_barrier(mem_flags::mem_threadgroup);  /* smem_sorted ready */              \
+                                                                                           \
+    for (uint vps_i = vps_start; vps_i < vps_end; vps_i++) {                               \
+        uint v = (uint)valid_kernel[vps_i];                                                \
+                                                                                           \
+        /* Gather neighbor[sorted_idx[row], v] into smem_nb. */                            \
+        for (uint i = lid; i < B1; i += threads) {                                         \
+            int sn = smem_sorted[i];                                                       \
+            smem_nb[i] = (sn >= 0) ? neighbor[(uint)sn * V + v] : SENTINEL;                \
+        }                                                                                  \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                   \
+                                                                                           \
+        for (uint bk = 0; bk < Ci; bk += BK) {                                             \
+            for (uint i = lid; i < B1 * BK; i += threads) {                                \
+                uint row = i / BK;                                                         \
+                uint col = i % BK;                                                         \
+                uint ci_idx = bk + col;                                                    \
+                uint nb_idx = smem_nb[row];                                                \
+                smem_a[row * BK + col] = (nb_idx != SENTINEL && ci_idx < Ci) ?             \
+                    input[nb_idx * Ci + ci_idx] : (ELEM_T)0;                               \
+            }                                                                              \
+            for (uint i = lid; i < BK * B2; i += threads) {                                \
+                uint row = i / B2;                                                         \
+                uint col = i % B2;                                                         \
+                uint ci_idx = bk + row;                                                    \
+                uint co_idx = co_base + col;                                               \
+                smem_b[row * B2 + col] = (ci_idx < Ci && co_idx < Co) ?                    \
+                    weight[(co_idx * V + v) * Ci + ci_idx] : (ELEM_T)0;                    \
+            }                                                                              \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                               \
+                                                                                           \
+            simdgroup_matrix<ELEM_T, 8, 8> a_mat;                                          \
+            for (uint k8 = 0; k8 < BK; k8 += 8) {                                          \
+                simdgroup_load(a_mat, smem_a + simd_id * 8 * BK + k8, BK);                 \
+                for (uint tn = 0; tn < TILES_N; tn++) {                                    \
+                    simdgroup_matrix<ELEM_T, 8, 8> b_mat;                                  \
+                    simdgroup_load(b_mat, smem_b + k8 * B2 + tn * 8, B2);                  \
+                    simdgroup_multiply_accumulate(acc[tn], a_mat, b_mat, acc[tn]);         \
+                }                                                                          \
+            }                                                                              \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                               \
+        }                                                                                  \
+    }                                                                                      \
+                                                                                           \
+    for (uint tn = 0; tn < TILES_N; tn++) {                                                \
+        simdgroup_store(acc[tn], smem_out + simd_id * 8 * B2 + tn * 8, B2);                \
+    }                                                                                      \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                       \
+                                                                                           \
+    /* Scatter to original row positions via sorted_idx. */                                \
+    for (uint i = lid; i < B1 * B2; i += threads) {                                        \
+        uint row = i / B2;                                                                 \
+        uint col = i % B2;                                                                 \
+        int sn = smem_sorted[row];                                                         \
+        uint co = co_base + col;                                                           \
+        if (sn >= 0 && co < Co) {                                                          \
+            float val = smem_out[row * B2 + col];                                          \
+            if (has_bias) val += (float)bias[co];                                          \
+            output[(uint)sn * Co + co] = (ELEM_T)val;                                      \
+        }                                                                                  \
+    }                                                                                      \
+}
+
+// fp32 specialization: output reuses the smem_a+smem_b region (16384 bytes of
+// float scratch, > the 64*64*4 = 16384 bytes the simdgroup_store writes).
+kernel void spconv_fwd_masked_implicit_gemm(
+    const device float* input            [[buffer(0)]],
+    const device float* weight           [[buffer(1)]],
+    const device float* bias             [[buffer(2)]],
+    const device uint*  neighbor         [[buffer(3)]],
+    const device int*   sorted_idx       [[buffer(4)]],
+    const device int*   valid_kernel     [[buffer(5)]],
+    const device int*   valid_kernel_seg [[buffer(6)]],
+    device       float* output           [[buffer(7)]],
+    constant     uint&  N                [[buffer(8)]],
+    constant     uint&  Co               [[buffer(9)]],
+    constant     uint&  Ci               [[buffer(10)]],
+    constant     uint&  V                [[buffer(11)]],
+    constant     uint&  has_bias         [[buffer(12)]],
+    threadgroup  float* smem             [[threadgroup(0)]],
+    uint2 gid   [[threadgroup_position_in_grid]],
+    uint  lid   [[thread_index_in_threadgroup]],
+    uint  simd_id  [[simdgroup_index_in_threadgroup]],
+    uint  lane_id  [[thread_index_in_simdgroup]]
+) {
+    uint n_block_idx = gid.x;
+    uint n_base  = n_block_idx * B1;
+    uint co_base = gid.y * B2;
+    uint threads = GEMM_THREADS;
+
+    threadgroup float* smem_a       = smem;
+    threadgroup float* smem_b       = smem + B1 * BK;
+    threadgroup uint*  smem_nb      = (threadgroup uint*)(smem + B1 * BK + BK * B2);
+    threadgroup int*   smem_sorted  = (threadgroup int*)(smem_nb + B1);
+
+    for (uint i = lid; i < B1; i += threads) {
+        uint n = n_base + i;
+        smem_sorted[i] = (n < N) ? sorted_idx[n] : -1;
+    }
+
+    uint vps_start = (uint)valid_kernel_seg[n_block_idx];
+    uint vps_end   = (uint)valid_kernel_seg[n_block_idx + 1];
+
+    simdgroup_matrix<float, 8, 8> acc[TILES_N];
+    for (uint i = 0; i < TILES_N; i++)
+        acc[i] = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint vps_i = vps_start; vps_i < vps_end; vps_i++) {
+        uint v = (uint)valid_kernel[vps_i];
+
+        for (uint i = lid; i < B1; i += threads) {
+            int sn = smem_sorted[i];
+            smem_nb[i] = (sn >= 0) ? neighbor[(uint)sn * V + v] : SENTINEL;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint bk = 0; bk < Ci; bk += BK) {
+            for (uint i = lid; i < B1 * BK; i += threads) {
+                uint row = i / BK;
+                uint col = i % BK;
+                uint ci_idx = bk + col;
+                uint nb_idx = smem_nb[row];
+                smem_a[row * BK + col] = (nb_idx != SENTINEL && ci_idx < Ci) ?
+                    input[nb_idx * Ci + ci_idx] : 0.0f;
+            }
+            for (uint i = lid; i < BK * B2; i += threads) {
+                uint row = i / B2;
+                uint col = i % B2;
+                uint ci_idx = bk + row;
+                uint co_idx = co_base + col;
+                smem_b[row * B2 + col] = (ci_idx < Ci && co_idx < Co) ?
+                    weight[(co_idx * V + v) * Ci + ci_idx] : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_matrix<float, 8, 8> a_mat;
+            for (uint k8 = 0; k8 < BK; k8 += 8) {
+                simdgroup_load(a_mat, smem_a + simd_id * 8 * BK + k8, BK);
+                for (uint tn = 0; tn < TILES_N; tn++) {
+                    simdgroup_matrix<float, 8, 8> b_mat;
+                    simdgroup_load(b_mat, smem_b + k8 * B2 + tn * 8, B2);
+                    simdgroup_multiply_accumulate(acc[tn], a_mat, b_mat, acc[tn]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint tn = 0; tn < TILES_N; tn++) {
+        simdgroup_store(acc[tn], smem_a + simd_id * 8 * B2 + tn * 8, B2);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lid; i < B1 * B2; i += threads) {
+        uint row = i / B2;
+        uint col = i % B2;
+        int sn = smem_sorted[row];
+        uint co = co_base + col;
+        if (sn >= 0 && co < Co) {
+            float val = smem_a[row * B2 + col];
+            if (has_bias) val += bias[co];
+            output[(uint)sn * Co + co] = val;
+        }
+    }
+}
+
+SPCONV_FWD_MASKED_KERNEL(spconv_fwd_masked_implicit_gemm_half, half)
+SPCONV_FWD_MASKED_KERNEL(spconv_fwd_masked_implicit_gemm_bfloat, bfloat)

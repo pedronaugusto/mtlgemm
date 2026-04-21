@@ -77,40 +77,50 @@ def sparse_submanifold_conv_bwd_implicit_gemm(grad_output, input, weight, bias, 
 sparse_submanifold_conv_fwd_implicit_gemm_splitk = sparse_submanifold_conv_fwd_implicit_gemm
 sparse_submanifold_conv_bwd_implicit_gemm_splitk = sparse_submanifold_conv_bwd_implicit_gemm
 
-# Masked implicit GEMM: the dense implicit GEMM kernel is used as a fallback
-# with the masking arguments dropped. The masked variant (which skips invalid
-# kernel positions in the V loop) is not yet implemented on Metal — it is a
-# perf optimization, not a correctness requirement. Warn once per process so
-# callers know they're not getting the algorithm they selected.
+# Masked implicit GEMM forward calls the real Metal kernel (skips invalid V
+# positions per n-block via the precomputed sorted_idx + valid_kernel +
+# valid_kernel_seg). Backward still aliases to the dense kernel — masked
+# backward is forward-only-relevant for trellis2 inference and lands in a
+# follow-up. See FOLLOWUPS.md.
 import os as _os
 import warnings as _warnings
-_MASKED_WARNED = False
 
-def _warn_masked_once():
-    global _MASKED_WARNED
-    if _MASKED_WARNED:
+# B1 block size in the masked kernel (must match GEMM_BLOCK_N in metal/config.h).
+_MASKED_B1 = 64
+
+_MASKED_BWD_WARNED = False
+
+def _warn_masked_bwd_once():
+    global _MASKED_BWD_WARNED
+    if _MASKED_BWD_WARNED:
         return
-    _MASKED_WARNED = True
-    # Opt out via FLEX_GEMM_QUIET=1 for library consumers that already know.
+    _MASKED_BWD_WARNED = True
     if _os.environ.get("FLEX_GEMM_QUIET") == "1":
         return
     _warnings.warn(
-        "flex_gemm (Metal backend): masked implicit GEMM is not yet implemented "
-        "on Metal — falling back to the dense implicit GEMM kernel. Results are "
-        "numerically identical; the masking is a throughput optimization. "
-        "Set FLEX_GEMM_QUIET=1 to silence this.",
+        "flex_gemm (Metal backend): masked implicit GEMM backward is not yet "
+        "implemented on Metal — falling back to the dense backward. Forward is "
+        "the masked kernel. Set FLEX_GEMM_QUIET=1 to silence this.",
         stacklevel=3,
     )
 
 def sparse_submanifold_conv_fwd_masked_implicit_gemm(input, weight, bias, neighbor_map,
                                                       sorted_idx, valid_kernel_cb, valid_kernel_seg_cb):
-    _warn_masked_once()
-    return sparse_submanifold_conv_fwd_implicit_gemm(input, weight, bias, neighbor_map)
+    valid_kernel = valid_kernel_cb(_MASKED_B1)
+    valid_kernel_seg = valid_kernel_seg_cb(_MASKED_B1)
+    return _C.spconv_fwd_masked_implicit_gemm(
+        input.contiguous(), weight.contiguous(),
+        bias.contiguous() if bias is not None else torch.empty(0),
+        neighbor_map.contiguous(),
+        sorted_idx.contiguous(),
+        valid_kernel.contiguous(),
+        valid_kernel_seg.contiguous(),
+    )
 
 def sparse_submanifold_conv_bwd_masked_implicit_gemm(grad_output, input, weight, bias, neighbor_map,
                                                       sorted_idx, valid_kernel_cb, valid_kernel_seg_cb,
                                                       valid_signal_i, valid_signal_o, valid_signal_seg):
-    _warn_masked_once()
+    _warn_masked_bwd_once()
     return sparse_submanifold_conv_bwd_implicit_gemm(grad_output, input, weight, bias, neighbor_map)
 
 sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk = sparse_submanifold_conv_fwd_masked_implicit_gemm

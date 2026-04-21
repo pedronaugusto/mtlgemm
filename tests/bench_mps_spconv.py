@@ -47,61 +47,75 @@ def bench(label, fn, num_warmup=5, num_iter=50, sync_fn=None):
 
 
 def run_shape(res, ch, dtype):
-    # Re-import so module-level FLEX_GEMM_AUTOTUNE is honored if it was just set.
-    from importlib import reload
     import flex_gemm
     from flex_gemm.ops.spconv import sparse_submanifold_conv3d, Algorithm, set_algorithm
 
     Co = ch
     Ks = 3
     V = Ks ** 3
-    set_algorithm(Algorithm.IMPLICIT_GEMM)
 
-    # MPS path (the new code)
     feats_m, coords_m, shape = sphere_coords(res, ch, dtype, "mps")
     weight_m = torch.randn(Co, Ks, Ks, Ks, ch, dtype=dtype).to("mps")
     bias_m = torch.randn(Co, dtype=dtype).to("mps")
     N = feats_m.shape[0]
 
-    # Build cache once so the timing only covers the GEMM kernel itself.
-    _, cache_m = sparse_submanifold_conv3d(feats_m, coords_m, shape, weight_m, bias_m)
+    # Build dense cache for the dense path.
+    set_algorithm(Algorithm.IMPLICIT_GEMM)
+    dense_out, cache_dense = sparse_submanifold_conv3d(feats_m, coords_m, shape, weight_m, bias_m)
 
-    # CPU path (mimics the OLD broken code's behavior — every input went to CPU
-    # and outputs were CPU tensors. Comparing these two tells us the perf gain
-    # from staying on MPS.)
+    # Build masked cache (different cache schema — gray_code, sorted_idx, etc.)
+    set_algorithm(Algorithm.MASKED_IMPLICIT_GEMM)
+    masked_out, cache_masked = sparse_submanifold_conv3d(feats_m, coords_m, shape, weight_m, bias_m)
+
+    # Numerical parity check inside the bench so a regression here is loud.
+    diff = (masked_out.detach().cpu().float() - dense_out.detach().cpu().float()).abs().max().item()
+    parity_tol = {torch.float16: 2e-2, torch.bfloat16: 5e-2, torch.float32: 1e-4}[dtype]
+    parity_ok = diff <= parity_tol
+    parity_msg = "OK" if parity_ok else f"FAIL diff={diff:.4e} tol={parity_tol:.4e}"
+
+    # CPU path (mimics the OLD broken code's behavior — every input went to CPU.)
     feats_c = feats_m.cpu().contiguous()
     coords_c = coords_m.cpu().contiguous()
     weight_c = weight_m.cpu().contiguous()
     bias_c = bias_m.cpu().contiguous()
+    set_algorithm(Algorithm.IMPLICIT_GEMM)
     _, cache_c = sparse_submanifold_conv3d(feats_c, coords_c, shape, weight_c, bias_c)
 
-    print(f"\nshape: res={res}, ch={ch}, dtype={dtype}, N={N}, V={V}")
+    print(f"\nshape: res={res}, ch={ch}, dtype={dtype}, N={N}, V={V}  parity[masked vs dense]={parity_msg}")
 
-    def _mps():
-        sparse_submanifold_conv3d(feats_m, coords_m, shape, weight_m, bias_m, neighbor_cache=cache_m)
+    def _mps_dense():
+        set_algorithm(Algorithm.IMPLICIT_GEMM)
+        sparse_submanifold_conv3d(feats_m, coords_m, shape, weight_m, bias_m, neighbor_cache=cache_dense)
+
+    def _mps_masked():
+        set_algorithm(Algorithm.MASKED_IMPLICIT_GEMM)
+        sparse_submanifold_conv3d(feats_m, coords_m, shape, weight_m, bias_m, neighbor_cache=cache_masked)
 
     def _cpu_old_path():
         # Simulate the old broken behavior: take MPS inputs, drop to CPU, run
         # kernel on CPU memory, return CPU tensor — what every spconv call did.
+        set_algorithm(Algorithm.IMPLICIT_GEMM)
         feats_round = feats_m.cpu().contiguous()
         weight_round = weight_m.cpu().contiguous()
         bias_round = bias_m.cpu().contiguous()
         out, _ = sparse_submanifold_conv3d(feats_round, coords_c, shape,
                                             weight_round, bias_round, neighbor_cache=cache_c)
-        # And then the next op would push it back to MPS.
         out.to("mps")
 
     def _cpu_native():
-        # Best case for the CPU path: inputs already on CPU, no round-trip.
+        set_algorithm(Algorithm.IMPLICIT_GEMM)
         sparse_submanifold_conv3d(feats_c, coords_c, shape, weight_c, bias_c, neighbor_cache=cache_c)
 
-    mps_ms = bench("flex_gemm MPS-native (new)", _mps, sync_fn=torch.mps.synchronize)
-    old_ms = bench("flex_gemm OLD CPU-bounce path (per-call MPS roundtrip)", _cpu_old_path, sync_fn=torch.mps.synchronize)
-    cpu_ms = bench("flex_gemm CPU-only (best case for CPU path)", _cpu_native)
+    dense_ms = bench("flex_gemm MPS dense implicit GEMM",     _mps_dense,    sync_fn=torch.mps.synchronize)
+    mskd_ms  = bench("flex_gemm MPS masked implicit GEMM",    _mps_masked,   sync_fn=torch.mps.synchronize)
+    old_ms   = bench("flex_gemm OLD CPU-bounce path",          _cpu_old_path, sync_fn=torch.mps.synchronize)
+    cpu_ms   = bench("flex_gemm CPU-only (best CPU case)",     _cpu_native)
 
-    speedup_vs_old = old_ms / mps_ms
-    print(f"  speedup vs old MPS-bouncing behavior: {speedup_vs_old:.2f}x")
-    return mps_ms, old_ms, cpu_ms
+    speedup_vs_old   = old_ms / mskd_ms
+    speedup_vs_dense = dense_ms / mskd_ms
+    print(f"  speedup masked vs dense (MPS):     {speedup_vs_dense:.2f}x")
+    print(f"  speedup masked vs old CPU-bounce:  {speedup_vs_old:.2f}x")
+    return dense_ms, mskd_ms, old_ms, cpu_ms, parity_ok
 
 
 print("=" * 75)
@@ -109,21 +123,23 @@ print("mtlgemm Metal spconv benchmark on MPS")
 print(f"PyTorch {torch.__version__}, MPS device: {torch.mps.current_allocated_memory() // 1024**2}MB")
 print("=" * 75)
 results = []
-# Trellis2-decoder-relevant shapes
+# Trellis2-decoder-relevant shapes (last two stress the wide-tile variant added in Phase C)
 for res, ch, dtype in [
     (16, 64, torch.float16),
     (32, 64, torch.float16),
     (32, 128, torch.float16),
     (64, 128, torch.float16),
     (64, 256, torch.float16),
+    (128, 256, torch.float16),
 ]:
-    mps, old, cpu = run_shape(res, ch, dtype)
-    results.append((res, ch, dtype, mps, old, cpu))
+    dense, mskd, old, cpu, parity = run_shape(res, ch, dtype)
+    results.append((res, ch, dtype, dense, mskd, old, cpu, parity))
 
 print("\n" + "=" * 75)
 print("Summary (lower is better)")
 print("=" * 75)
-print(f"{'shape':28s}  {'mps-new':>10s}  {'mps-old':>10s}  {'cpu-only':>10s}  {'gain':>6s}")
-for res, ch, dt, m, o, c in results:
+print(f"{'shape':28s}  {'dense':>9s}  {'masked':>9s}  {'mps-old':>9s}  {'cpu':>9s}  {'msk/dense':>10s}  {'msk/old':>8s}  {'parity':>7s}")
+for res, ch, dt, d, m, o, c, parity in results:
     print(f"res={res:3d} ch={ch:3d} dt={str(dt).split('.')[-1]:8s}  "
-          f"{m:7.3f}ms  {o:7.3f}ms  {c:7.3f}ms  {o/m:5.2f}x")
+          f"{d:6.3f}ms  {m:6.3f}ms  {o:6.3f}ms  {c:6.3f}ms  "
+          f"{m/d:8.2f}x  {o/m:6.2f}x  {('OK' if parity else 'FAIL'):>7s}")
