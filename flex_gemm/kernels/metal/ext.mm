@@ -1199,12 +1199,35 @@ static uint32_t gemm_smem_bwd_weight_masked(torch::ScalarType dtype) {
     return base + (uint32_t)(64 * 64 * sizeof(float));
 }
 
-// Wide-tile (B2=128) kernels exist in spconv_gemm.metal but are currently
-// unused — measurement on M4 Pro showed the wider tile *regressed* perf at
-// trellis2 shapes (e.g. res=32 ch=128 went from 0.50ms to 0.67ms with tile128).
+// Wide-tile (B2=128) kernels exist in spconv_gemm.metal but are gated off by
+// default — prior measurement showed the wider tile regressed perf at every
+// trellis2 shape (e.g. res=32 ch=128 went from 0.50ms to 0.67ms with tile128).
 // Apple Silicon's scheduling appears to prefer many narrow tiles over few wide
-// ones for this workload, contrary to the typical NVIDIA pattern. The kernel
-// sources are retained for future profiling work — tracked in FOLLOWUPS.md.
+// ones for this workload, contrary to the typical NVIDIA pattern. Set
+// FLEX_GEMM_TILE128=1 to re-enable at dispatch time for re-profiling.
+static bool use_tile128_env() {
+    static bool enabled = []() {
+        const char* env = std::getenv("FLEX_GEMM_TILE128");
+        return env != nullptr && std::string(env) == "1";
+    }();
+    return enabled;
+}
+
+static uint32_t gemm_smem_fwd_input_t128(torch::ScalarType dtype) {
+    // smem_a[B1*BK] + smem_b[BK*B2_T128] + smem_nb[B1] + 1 atomic + smem_out[B1*HALF_COLS]
+    size_t es = gemm_elem_bytes(dtype);
+    // fp32 tile128 kernel is not defined — only half/bfloat have tile128.
+    uint32_t base = (uint32_t)(64 * 32 * es + 32 * 128 * es
+                               + 64 * sizeof(uint32_t) + sizeof(uint32_t));
+    return base + (uint32_t)(64 * 64 * sizeof(float));
+}
+
+static uint32_t gemm_smem_fwd_masked_t128(torch::ScalarType dtype) {
+    size_t es = gemm_elem_bytes(dtype);
+    uint32_t base = (uint32_t)(64 * 32 * es + 32 * 128 * es
+                               + 64 * sizeof(uint32_t) + 64 * sizeof(int32_t));
+    return base + (uint32_t)(64 * 64 * sizeof(float));
+}
 
 // Threadgroup memory bytes for bwd_weight (no smem_nb in this kernel).
 static uint32_t gemm_smem_bwd_weight(torch::ScalarType dtype) {
@@ -1265,14 +1288,22 @@ torch::Tensor spconv_fwd_implicit_gemm(
     }
     uint32_t has_bias = (bias.numel() > 0) ? 1 : 0;
 
-    // Grid: (cdiv(N, 64), cdiv(Co, 64)), Threadgroup: 256.
-    // (A wide-tile B2=128 variant exists in the .metal file but is currently
-    // disabled — see use_tile128() above for the rationale.)
+    // Grid: (cdiv(N, 64), cdiv(Co, 64 or 128)), Threadgroup: 256.
+    // Wide-tile (B2=128) is gated by FLEX_GEMM_TILE128=1. Only fp16/bf16 have
+    // tile128 kernels; fp32 stays on the 64x64 tile regardless.
+    bool tile128 = use_tile128_env()
+                   && input.scalar_type() != torch::kFloat32
+                   && Co >= 128;
+    uint32_t B2_eff = tile128 ? 128 : 64;
     uint32_t grid_x = (N + 63) / 64;
-    uint32_t grid_y = (Co + 63) / 64;
-    uint32_t shared_mem = gemm_smem_fwd_input(input.scalar_type());
+    uint32_t grid_y = (Co + B2_eff - 1) / B2_eff;
+    uint32_t shared_mem = tile128
+        ? gemm_smem_fwd_input_t128(input.scalar_type())
+        : gemm_smem_fwd_input(input.scalar_type());
 
-    std::string kernel_name = std::string("spconv_fwd_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
+    std::string kernel_name = tile128
+        ? std::string("spconv_fwd_implicit_gemm_t128") + gemm_dtype_suffix(input.scalar_type())
+        : std::string("spconv_fwd_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
 
     auto setup = [&](id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:buf_input.buffer    offset:buf_input.offset    atIndex:0];
@@ -1370,11 +1401,19 @@ torch::Tensor spconv_fwd_masked_implicit_gemm(
     }
     uint32_t has_bias = (bias.numel() > 0) ? 1 : 0;
 
+    bool tile128 = use_tile128_env()
+                   && input.scalar_type() != torch::kFloat32
+                   && Co >= 128;
+    uint32_t B2_eff = tile128 ? 128 : 64;
     uint32_t grid_x = (N + 63) / 64;
-    uint32_t grid_y = (Co + 63) / 64;
-    uint32_t shared_mem = gemm_smem_fwd_masked(input.scalar_type());
+    uint32_t grid_y = (Co + B2_eff - 1) / B2_eff;
+    uint32_t shared_mem = tile128
+        ? gemm_smem_fwd_masked_t128(input.scalar_type())
+        : gemm_smem_fwd_masked(input.scalar_type());
 
-    std::string kernel_name = std::string("spconv_fwd_masked_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
+    std::string kernel_name = tile128
+        ? std::string("spconv_fwd_masked_implicit_gemm_t128") + gemm_dtype_suffix(input.scalar_type())
+        : std::string("spconv_fwd_masked_implicit_gemm") + gemm_dtype_suffix(input.scalar_type());
 
     auto setup = [&](id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:buf_input.buffer    offset:buf_input.offset    atIndex:0];
