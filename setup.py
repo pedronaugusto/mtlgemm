@@ -63,24 +63,41 @@ if BUILD_TARGET == "metal":
             build_temp = os.path.join(self.build_temp, "metal")
             os.makedirs(build_temp, exist_ok=True)
 
+            # Header dependencies: any .h/.metal changes should invalidate .air.
+            metal_headers = glob.glob(os.path.join(METAL_DIR, "**", "*.h"), recursive=True)
+
+            def _mtime(path):
+                return os.path.getmtime(path) if os.path.exists(path) else 0.0
+
+            max_header_mtime = max((_mtime(h) for h in metal_headers), default=0.0)
+
             for src in metal_sources:
                 air = os.path.join(build_temp, os.path.basename(src).replace(".metal", ".air"))
-                cmd = [
-                    "xcrun", "-sdk", "macosx", "metal",
-                    "-c", src, "-o", air,
-                    "-std=metal4.0", "-O2",
-                    "-D__HAVE_ATOMIC_ULONG__=1",
-                    "-D__HAVE_ATOMIC_ULONG_MIN_MAX__=1",
-                ] + include_flags
-                print(f"  Compiling {os.path.basename(src)} -> {os.path.basename(air)}")
-                subprocess.check_call(cmd)
+                src_m = _mtime(src)
+                air_m = _mtime(air)
+                needs = air_m == 0.0 or air_m < src_m or air_m < max_header_mtime
+                if needs:
+                    cmd = [
+                        "xcrun", "-sdk", "macosx", "metal",
+                        "-c", src, "-o", air,
+                        "-std=metal4.0", "-O2",
+                        "-D__HAVE_ATOMIC_ULONG__=1",
+                        "-D__HAVE_ATOMIC_ULONG_MIN_MAX__=1",
+                    ] + include_flags
+                    print(f"  Compiling {os.path.basename(src)} -> {os.path.basename(air)}")
+                    subprocess.check_call(cmd)
                 air_files.append(air)
 
-            # Step 2: Link .air -> flex_gemm.metallib
+            # Step 2: Link .air -> flex_gemm.metallib, skip if up to date.
             metallib = os.path.join(build_temp, "flex_gemm.metallib")
-            cmd = ["xcrun", "-sdk", "macosx", "metallib"] + air_files + ["-o", metallib]
-            print(f"  Linking -> flex_gemm.metallib")
-            subprocess.check_call(cmd)
+            metallib_m = _mtime(metallib)
+            max_air = max((_mtime(a) for a in air_files), default=0.0)
+            if metallib_m == 0.0 or metallib_m < max_air:
+                cmd = ["xcrun", "-sdk", "macosx", "metallib"] + air_files + ["-o", metallib]
+                print(f"  Linking -> flex_gemm.metallib")
+                subprocess.check_call(cmd)
+            else:
+                print(f"  flex_gemm.metallib up to date, skipping link")
 
             # Step 3: Resolve torch paths and build the C++ extension
             for ext in self.extensions:
@@ -123,12 +140,21 @@ if BUILD_TARGET == "metal":
 
     METAL_REL = os.path.join("flex_gemm", "kernels", "metal")
 
+    # Dependencies: all .metal and .h files under the metal dir. This teaches
+    # `pip install -e .` to invalidate cached artifacts when shader source
+    # changes — without it, editable installs skip build_ext entirely.
+    metal_deps = (
+        glob.glob(os.path.join(METAL_DIR, "**", "*.metal"), recursive=True)
+        + glob.glob(os.path.join(METAL_DIR, "**", "*.h"), recursive=True)
+    )
+
     ext = LazyMetalExtension(
         name="flex_gemm.kernels.metal._C",
         sources=[
             os.path.join(METAL_REL, "ext.mm"),
             os.path.join(METAL_REL, "common", "metal_context.mm"),
         ],
+        depends=metal_deps,
         include_dirs=[
             METAL_DIR,
             os.path.join(METAL_DIR, "common"),

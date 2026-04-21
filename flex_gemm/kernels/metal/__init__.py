@@ -6,6 +6,44 @@ Exports 22 functions:
   - 10 Python-callable GEMM/weighted-sum functions from _C
 """
 
+import os as _os
+import warnings as _warnings
+
+
+def _metallib_staleness_check():
+    """Warn loudly if any .metal source is newer than the shipped metallib —
+    pip's editable-install path skips setup.py build_ext, so a `pip install
+    -e .` after editing a shader silently reuses the old metallib. Set
+    FLEX_GEMM_METALLIB_SKIP_CHECK=1 to silence."""
+    if _os.environ.get("FLEX_GEMM_METALLIB_SKIP_CHECK") == "1":
+        return
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    metallib = _os.path.join(here, "flex_gemm.metallib")
+    if not _os.path.exists(metallib):
+        return  # fresh install, not our business
+    lib_m = _os.path.getmtime(metallib)
+    newer = []
+    for root, _, files in _os.walk(here):
+        for f in files:
+            if f.endswith((".metal", ".h")):
+                p = _os.path.join(root, f)
+                if _os.path.getmtime(p) > lib_m + 1:  # 1s slop for fs granularity
+                    newer.append(_os.path.relpath(p, here))
+    if newer:
+        _warnings.warn(
+            "flex_gemm.metallib is older than these shader sources:\n  - "
+            + "\n  - ".join(newer[:6])
+            + ("\n  ...\n" if len(newer) > 6 else "\n")
+            + "Rebuild with: cd $(python -c 'import flex_gemm, os; "
+            "print(os.path.dirname(flex_gemm.__file__) + \"/..\")')  && "
+            "python setup.py build_ext --inplace\n"
+            "Or set FLEX_GEMM_METALLIB_SKIP_CHECK=1 to silence.",
+            stacklevel=3,
+        )
+
+
+_metallib_staleness_check()
+
 from . import _C
 
 # ============================================================================
