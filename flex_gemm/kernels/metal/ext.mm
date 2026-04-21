@@ -1782,6 +1782,60 @@ torch::Tensor sparse_attention_fwd(
     float scale_f = (float)scale;
 
     const char* suffix = spconv::gemm_dtype_suffix(q.scalar_type());
+
+    // Two kernel variants in source: the naive per-thread-serial-KV kernel
+    // (default) and a tiled flash-attention-v2 variant with cooperative
+    // K/V-tile loads into threadgroup memory. Measured on M3 Max: the tiled
+    // variant currently regresses at all tested shapes — the per-thread dot
+    // product inside the inner loop forfeits the SIMD matmul benefit that
+    // makes flash-attn fast, and the threadgroup barriers + cooperative
+    // load overhead outweigh the smem sharing for head_dim=64 on Apple
+    // Silicon's cache hierarchy. Kept in source for future profiling work
+    // (switching the inner loop to simdgroup_matrix_multiply_accumulate on
+    // Q@K^T would likely unlock it). Opt in via FLEX_GEMM_ATTN_KERNEL=tiled.
+    const char* env_kernel = std::getenv("FLEX_GEMM_ATTN_KERNEL");
+    bool use_tiled = env_kernel && std::string(env_kernel) == "tiled";
+
+    if (use_tiled) {
+        // Tiled flash-attention: threadgroup of TILES_Q=32, smem K_tile + V_tile.
+        const uint32_t TILES_Q_V = 32;
+        const uint32_t TILES_KV_V = 32;
+        size_t elem_bytes = (q.scalar_type() == torch::kFloat32) ? 4 : 2;
+        uint32_t shared_mem = (uint32_t)(TILES_KV_V * C_q * elem_bytes
+                                        + TILES_KV_V * C_v * elem_bytes);
+
+        std::string kernel_name = std::string("sparse_attention_tiled_fwd") + suffix;
+
+        auto setup_tiled = [&](id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:buf_q.buffer    offset:buf_q.offset    atIndex:0];
+            [enc setBuffer:buf_k.buffer    offset:buf_k.offset    atIndex:1];
+            [enc setBuffer:buf_v.buffer    offset:buf_v.offset    atIndex:2];
+            [enc setBuffer:buf_csq.buffer  offset:buf_csq.offset  atIndex:3];
+            [enc setBuffer:buf_cskv.buffer offset:buf_cskv.offset atIndex:4];
+            [enc setBuffer:out.buffer      offset:out.offset      atIndex:5];
+            [enc setBytes:&H_u     length:sizeof(H_u)     atIndex:6];
+            [enc setBytes:&Cq_u    length:sizeof(Cq_u)    atIndex:7];
+            [enc setBytes:&Cv_u    length:sizeof(Cv_u)    atIndex:8];
+            [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:9];
+            [enc setThreadgroupMemoryLength:shared_mem atIndex:0];
+        };
+
+        MTLSize tg = MTLSizeMake(TILES_Q_V, 1, 1);
+        MTLSize grid_tgs = MTLSizeMake(
+            ((NSUInteger)max_q_seqlen + TILES_Q_V - 1) / TILES_Q_V,
+            (NSUInteger)H,
+            (NSUInteger)N);
+
+        if (on_mps) {
+            ctx().dispatch_threadgroups_mps(kernel_name, setup_tiled, grid_tgs, tg);
+        } else {
+            ctx().dispatch_threadgroups(kernel_name, setup_tiled, grid_tgs, tg,
+                                        /*wait=*/true);
+        }
+        return out.backing;
+    }
+
+    // Naive path (default at small max_seqlen).
     std::string kernel_name = std::string("sparse_attention_fwd") + suffix;
 
     auto setup = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1797,9 +1851,6 @@ torch::Tensor sparse_attention_fwd(
         [enc setBytes:&scale_f length:sizeof(scale_f) atIndex:9];
     };
 
-    // Grid: (max_q_seqlen, H, N). Threadgroup: 32 threads in x dimension, 1
-    // head per tg. Threads beyond the per-sequence q_len early-exit inside
-    // the kernel.
     NSUInteger tg_x = std::min((NSUInteger)32, (NSUInteger)std::max<int64_t>(max_q_seqlen, 1));
     MTLSize tg = MTLSizeMake(tg_x, 1, 1);
     MTLSize grid_tgs = MTLSizeMake(
