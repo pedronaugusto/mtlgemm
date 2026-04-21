@@ -117,3 +117,113 @@ def test_masked_cache_reuse_stable(dtype):
     out2, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias, neighbor_cache=cache)
 
     assert torch.equal(out1, out2), "Reusing the masked cache should be deterministic"
+
+
+# ============================================================================
+# Edge cases: trailing-rows mask path (N not divisible by B1=64), channel counts
+# not divisible by B2=64, and V=1 (degenerate masked-V loop).
+# ============================================================================
+
+
+def _random_coords(n: int, res: int, ch: int, dtype, device, seed: int = 0):
+    """Produce N distinct sparse voxels at random positions — lets us hit any
+    N value (unlike the sphere sampling, which is constrained by geometry)."""
+    torch.manual_seed(seed)
+    flat = torch.randperm(res * res * res)[:n]
+    cz = flat // (res * res)
+    cy = (flat // res) % res
+    cx = flat % res
+    coords = torch.stack([torch.zeros(n, dtype=torch.int32), cx.int(), cy.int(), cz.int()], dim=-1).contiguous()
+    coords = coords.to(device)
+    feats = torch.randn(n, ch, dtype=dtype).to(device).contiguous()
+    return feats, coords, torch.Size([1, ch, res, res, res])
+
+
+@needs_mps
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("ch", [96, 200])
+def test_masked_co_not_multiple_of_64(ch, dtype):
+    """Co=96 (not multiple of 64): hits the trailing-cols mask write path.
+    Co=200 (not multiple of 64 *or* 128): hits both trailing-cols masks
+    AND the tile128 trailing path if FLEX_GEMM_TILE128=1."""
+    torch.manual_seed(0x1D01 ^ ch)
+    device = "mps"
+    res = 16
+
+    feats, coords, shape = _sphere_coords(res, ch, dtype, device)
+    Co = ch
+    weight = torch.randn(Co, 3, 3, 3, ch, dtype=dtype).to(device)
+    bias = torch.randn(Co, dtype=dtype).to(device)
+
+    set_algorithm(Algorithm.IMPLICIT_GEMM)
+    dense_out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+    set_algorithm(Algorithm.MASKED_IMPLICIT_GEMM)
+    masked_out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+
+    tol = TOLERANCES[dtype]
+    a = masked_out.detach().cpu().float()
+    b = dense_out.detach().cpu().float()
+    diff = (a - b).abs()
+    assert torch.allclose(a, b, **tol), (
+        f"Co-trailing parity failed ch={ch} dtype={dtype}: max_err={diff.max().item():.4e} "
+        f"(atol={tol['atol']}, rtol={tol['rtol']})"
+    )
+
+
+@needs_mps
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("N", [13, 67, 191])
+def test_masked_small_n_trailing_rows(N, dtype):
+    """Small N hits the trailing-rows mask path in every N-block
+    (13 < B1; 67 = B1 + 3; 191 = 2*B1 + 63). Uses a random sparse layout so
+    neighbors are mostly SENTINEL, which also exercises the skip-empty paths."""
+    torch.manual_seed(0x1D02 ^ N)
+    device = "mps"
+    ch = 64
+    feats, coords, shape = _random_coords(N, res=16, ch=ch, dtype=dtype, device=device, seed=N)
+
+    weight = torch.randn(ch, 3, 3, 3, ch, dtype=dtype).to(device)
+    bias = torch.randn(ch, dtype=dtype).to(device)
+
+    set_algorithm(Algorithm.IMPLICIT_GEMM)
+    dense_out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+    set_algorithm(Algorithm.MASKED_IMPLICIT_GEMM)
+    masked_out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+
+    tol = TOLERANCES[dtype]
+    a = masked_out.detach().cpu().float()
+    b = dense_out.detach().cpu().float()
+    assert torch.allclose(a, b, **tol), (
+        f"small-N parity failed N={N} dtype={dtype}: max_err={(a-b).abs().max().item():.4e} "
+        f"(atol={tol['atol']}, rtol={tol['rtol']})"
+    )
+
+
+@needs_mps
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_masked_v1_1x1x1_conv(dtype):
+    """V=1 (1x1x1 conv): the masked V loop is degenerate (one valid v per
+    block, all rows are their own neighbor). Needs to reduce to the
+    identity-with-weight-mul case."""
+    torch.manual_seed(0x1D03)
+    device = "mps"
+    ch = 64
+    res = 16
+
+    feats, coords, shape = _sphere_coords(res, ch, dtype, device)
+    Ks = 1  # 1x1x1 kernel: V = 1
+    weight = torch.randn(ch, Ks, Ks, Ks, ch, dtype=dtype).to(device)
+    bias = torch.randn(ch, dtype=dtype).to(device)
+
+    set_algorithm(Algorithm.IMPLICIT_GEMM)
+    dense_out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+    set_algorithm(Algorithm.MASKED_IMPLICIT_GEMM)
+    masked_out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+
+    tol = TOLERANCES[dtype]
+    a = masked_out.detach().cpu().float()
+    b = dense_out.detach().cpu().float()
+    assert torch.allclose(a, b, **tol), (
+        f"V=1 parity failed dtype={dtype}: max_err={(a-b).abs().max().item():.4e} "
+        f"(atol={tol['atol']}, rtol={tol['rtol']})"
+    )
