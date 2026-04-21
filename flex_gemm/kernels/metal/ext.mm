@@ -1177,6 +1177,28 @@ static uint32_t gemm_smem_fwd_masked(torch::ScalarType dtype) {
     return base + (uint32_t)(64 * 64 * sizeof(float));
 }
 
+// Masked bwd-input shares the masked fwd smem layout (smem_a, smem_b, smem_nb,
+// smem_sorted; output reuses smem_a region in fp32 or has a separate smem_out
+// scratch in half/bfloat).
+static uint32_t gemm_smem_bwd_input_masked(torch::ScalarType dtype) {
+    return gemm_smem_fwd_masked(dtype);
+}
+
+// Masked bwd-weight smem: smem_a + smem_b + smem_si[BK] + smem_so[BK]
+// (+ smem_out[B1*B2] in half/bfloat).
+static uint32_t gemm_smem_bwd_weight_masked(torch::ScalarType dtype) {
+    size_t es = gemm_elem_bytes(dtype);
+    if (dtype == torch::kFloat32) {
+        return (uint32_t)((64 * 32 + 32 * 64) * sizeof(float)
+                          + 32 * sizeof(uint32_t)
+                          + 32 * sizeof(uint32_t));
+    }
+    uint32_t base = (uint32_t)(64 * 32 * es + 32 * 64 * es
+                               + 32 * sizeof(uint32_t)
+                               + 32 * sizeof(uint32_t));
+    return base + (uint32_t)(64 * 64 * sizeof(float));
+}
+
 // Wide-tile (B2=128) kernels exist in spconv_gemm.metal but are currently
 // unused — measurement on M4 Pro showed the wider tile *regressed* perf at
 // trellis2 shapes (e.g. res=32 ch=128 went from 0.50ms to 0.67ms with tile128).
@@ -1479,6 +1501,122 @@ std::tuple<torch::Tensor, torch::Tensor> spconv_bwd_implicit_gemm(
     return std::make_tuple(out_gi.backing, out_gw.backing);
 }
 
+// Masked implicit GEMM backward — uses precomputed sorted_idx + valid_kernel
+// + valid_kernel_seg for grad_input (identical V-set as fwd under u=V-1-v),
+// and valid_signal_i + valid_signal_o + valid_signal_seg for grad_weight.
+std::tuple<torch::Tensor, torch::Tensor> spconv_bwd_masked_implicit_gemm(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& neighbor,
+    const torch::Tensor& sorted_idx_i64,
+    const torch::Tensor& valid_kernel,
+    const torch::Tensor& valid_kernel_seg,
+    const torch::Tensor& valid_signal_i,
+    const torch::Tensor& valid_signal_o,
+    const torch::Tensor& valid_signal_seg
+) {
+    bool on_mps = input.device().is_mps();
+    uint32_t N  = (uint32_t)input.size(0);
+    uint32_t Ci = (uint32_t)input.size(1);
+    uint32_t Co = (uint32_t)weight.size(0);
+    uint32_t V  = (uint32_t)weight.size(1);
+
+    TORCH_CHECK(grad_output.scalar_type() == input.scalar_type(),
+                "spconv_bwd_masked_implicit_gemm: grad_output dtype must match input");
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
+                "spconv_bwd_masked_implicit_gemm: weight dtype must match input");
+    TORCH_CHECK(valid_kernel.scalar_type() == torch::kInt32,
+                "valid_kernel must be int32");
+    TORCH_CHECK(valid_kernel_seg.scalar_type() == torch::kInt32,
+                "valid_kernel_seg must be int32");
+    TORCH_CHECK(valid_signal_i.scalar_type() == torch::kUInt32,
+                "valid_signal_i must be uint32");
+    TORCH_CHECK(valid_signal_o.scalar_type() == torch::kUInt32,
+                "valid_signal_o must be uint32");
+    TORCH_CHECK(valid_signal_seg.scalar_type() == torch::kUInt32,
+                "valid_signal_seg must be uint32");
+
+    // sorted_idx from torch::argsort is int64; Metal kernel reads int32.
+    auto sorted_idx_i32 = sorted_idx_i64.scalar_type() == torch::kInt32
+        ? sorted_idx_i64
+        : sorted_idx_i64.to(torch::kInt32);
+
+    auto buf_go       = from_tensor(grad_output);
+    auto buf_input    = from_tensor(input);
+    auto buf_weight   = from_tensor(weight);
+    auto buf_neighbor = from_tensor(neighbor);
+    auto buf_sorted   = from_tensor(sorted_idx_i32);
+    auto buf_vk       = from_tensor(valid_kernel);
+    auto buf_vks      = from_tensor(valid_kernel_seg);
+    auto buf_vsi      = from_tensor(valid_signal_i);
+    auto buf_vso      = from_tensor(valid_signal_o);
+    auto buf_vss      = from_tensor(valid_signal_seg);
+    auto out_gi       = make_output({(int64_t)N, (int64_t)Ci}, input.scalar_type(), input.device());
+    auto out_gw       = make_output({(int64_t)Co, (int64_t)V, (int64_t)Ci}, weight.scalar_type(), input.device());
+
+    uint32_t shared_mem_input  = gemm_smem_bwd_input_masked(input.scalar_type());
+    uint32_t shared_mem_weight = gemm_smem_bwd_weight_masked(input.scalar_type());
+
+    const char* suffix = gemm_dtype_suffix(input.scalar_type());
+    std::string kernel_input  = std::string("spconv_bwd_input_masked_implicit_gemm")  + suffix;
+    std::string kernel_weight = std::string("spconv_bwd_weight_masked_implicit_gemm") + suffix;
+
+    auto setup_gi = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buf_go.buffer       offset:buf_go.offset       atIndex:0];
+        [enc setBuffer:buf_weight.buffer   offset:buf_weight.offset   atIndex:1];
+        [enc setBuffer:buf_neighbor.buffer offset:buf_neighbor.offset atIndex:2];
+        [enc setBuffer:buf_sorted.buffer   offset:buf_sorted.offset   atIndex:3];
+        [enc setBuffer:buf_vk.buffer       offset:buf_vk.offset       atIndex:4];
+        [enc setBuffer:buf_vks.buffer      offset:buf_vks.offset      atIndex:5];
+        [enc setBuffer:out_gi.buffer       offset:out_gi.offset       atIndex:6];
+        [enc setBytes:&N  length:sizeof(N)  atIndex:7];
+        [enc setBytes:&Co length:sizeof(Co) atIndex:8];
+        [enc setBytes:&Ci length:sizeof(Ci) atIndex:9];
+        [enc setBytes:&V  length:sizeof(V)  atIndex:10];
+        [enc setThreadgroupMemoryLength:shared_mem_input atIndex:0];
+    };
+
+    auto setup_gw = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buf_go.buffer    offset:buf_go.offset    atIndex:0];
+        [enc setBuffer:buf_input.buffer offset:buf_input.offset atIndex:1];
+        [enc setBuffer:buf_vsi.buffer   offset:buf_vsi.offset   atIndex:2];
+        [enc setBuffer:buf_vso.buffer   offset:buf_vso.offset   atIndex:3];
+        [enc setBuffer:buf_vss.buffer   offset:buf_vss.offset   atIndex:4];
+        [enc setBuffer:out_gw.buffer    offset:out_gw.offset    atIndex:5];
+        [enc setBytes:&N  length:sizeof(N)  atIndex:6];
+        [enc setBytes:&Co length:sizeof(Co) atIndex:7];
+        [enc setBytes:&Ci length:sizeof(Ci) atIndex:8];
+        [enc setBytes:&V  length:sizeof(V)  atIndex:9];
+        [enc setThreadgroupMemoryLength:shared_mem_weight atIndex:0];
+    };
+
+    uint32_t grid_x_gi = (N + 63) / 64;
+    uint32_t grid_y_gi = (Ci + 63) / 64;
+    uint32_t grid_x_gw = (Co + 63) / 64;
+    uint32_t grid_y_gw = (Ci + 63) / 64;
+
+    if (on_mps) {
+        ctx().dispatch_threadgroups_mps(kernel_input,  setup_gi,
+                                        MTLSizeMake(grid_x_gi, grid_y_gi, 1),
+                                        MTLSizeMake(256, 1, 1));
+        ctx().dispatch_threadgroups_mps(kernel_weight, setup_gw,
+                                        MTLSizeMake(grid_x_gw, grid_y_gw, V),
+                                        MTLSizeMake(256, 1, 1));
+    } else {
+        ctx().dispatch_threadgroups(kernel_input,  setup_gi,
+                                    MTLSizeMake(grid_x_gi, grid_y_gi, 1),
+                                    MTLSizeMake(256, 1, 1),
+                                    /*wait=*/false);
+        ctx().dispatch_threadgroups(kernel_weight, setup_gw,
+                                    MTLSizeMake(grid_x_gw, grid_y_gw, V),
+                                    MTLSizeMake(256, 1, 1),
+                                    /*wait=*/true);
+    }
+
+    return std::make_tuple(out_gi.backing, out_gw.backing);
+}
+
 } // namespace spconv
 
 } // namespace metal
@@ -1517,6 +1655,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("spconv_fwd_implicit_gemm", &spconv::spconv_fwd_implicit_gemm);
     m.def("spconv_fwd_masked_implicit_gemm", &spconv::spconv_fwd_masked_implicit_gemm);
     m.def("spconv_bwd_implicit_gemm", &spconv::spconv_bwd_implicit_gemm);
+    m.def("spconv_bwd_masked_implicit_gemm", &spconv::spconv_bwd_masked_implicit_gemm);
 
     // Autotune timing cache query
     m.def("spconv_get_timing_cache", []() {

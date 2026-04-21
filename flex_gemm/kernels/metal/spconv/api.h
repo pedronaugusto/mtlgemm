@@ -42,6 +42,36 @@ std::tuple<torch::Tensor, torch::Tensor> spconv_bwd_implicit_gemm(
     const torch::Tensor& neighbor
 );
 
+// Masked implicit GEMM forward — uses precomputed sorted_idx + valid_kernel
+// + valid_kernel_seg to iterate only the valid V positions per n-block.
+torch::Tensor spconv_fwd_masked_implicit_gemm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const torch::Tensor& neighbor,
+    const torch::Tensor& sorted_idx_i64,
+    const torch::Tensor& valid_kernel,
+    const torch::Tensor& valid_kernel_seg
+);
+
+// Masked implicit GEMM backward: returns (grad_input[N,Ci], grad_weight[Co,V,Ci]).
+// Uses the same precomputed sorted_idx / valid_kernel / valid_kernel_seg as the
+// forward (identical V-set under change of variable u = V-1-v) for grad_input,
+// and valid_signal_i / valid_signal_o / valid_signal_seg from
+// neighbor_map_post_process_for_masked_implicit_gemm_1 for grad_weight.
+std::tuple<torch::Tensor, torch::Tensor> spconv_bwd_masked_implicit_gemm(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& neighbor,
+    const torch::Tensor& sorted_idx_i64,
+    const torch::Tensor& valid_kernel,
+    const torch::Tensor& valid_kernel_seg,
+    const torch::Tensor& valid_signal_i,
+    const torch::Tensor& valid_signal_o,
+    const torch::Tensor& valid_signal_seg
+);
+
 } // namespace spconv
 } // namespace metal
 } // namespace flex_gemm
