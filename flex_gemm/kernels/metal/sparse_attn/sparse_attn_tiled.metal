@@ -38,7 +38,7 @@ using namespace metal;
 
 #define BLOCK_Q 16
 #define BLOCK_KV 32
-#define MAX_HEAD_DIM 64
+#define MAX_HEAD_DIM 128
 #define TG_THREADS 64
 #define SENTINEL_NEG_INF -1.0e30f
 
