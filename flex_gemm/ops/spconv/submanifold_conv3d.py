@@ -7,6 +7,26 @@ from .. import spconv, utils
 from ... import kernels
 
 
+#: Value stored in `neighbor_map` for "this kernel tap has no neighbour".
+EMPTY_NEIGHBOR = 0xffffffff
+
+
+def _sentinel(neighbor_map: torch.Tensor) -> torch.Tensor:
+    """`EMPTY_NEIGHBOR` as a 0-dim tensor matching `neighbor_map`.
+
+    `neighbor_map` is uint32. Comparing it against the Python int directly
+    works on CPU and CUDA but raises on MPS:
+
+        RuntimeError: Promotion for uint16, uint32, uint64 types is not
+        supported, attempted to promote UInt32 and Long
+
+    because the literal is a Long and MPS refuses the promotion. Building the
+    scalar in the map's own dtype sidesteps promotion entirely on every
+    backend.
+    """
+    return torch.tensor(EMPTY_NEIGHBOR, dtype=neighbor_map.dtype, device=neighbor_map.device)
+
+
 class SubMConv3dNeighborCache:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -123,7 +143,7 @@ class SubMConv3dFunction(Function):
         neighbor_search_indices = torch.searchsorted(sorted_keys, neighbor_keys)
         neighbor_search_indices = torch.clamp(neighbor_search_indices, 0, sorted_keys.shape[0] - 1)
         neighbor_valid &= sorted_keys[neighbor_search_indices] == neighbor_keys
-        neighbor_indices = torch.full((L * kernel_size[0] * kernel_size[1] * kernel_size[2],), 0xffffffff, dtype=torch.long, device=coords.device)
+        neighbor_indices = torch.full((L * kernel_size[0] * kernel_size[1] * kernel_size[2],), EMPTY_NEIGHBOR, dtype=torch.long, device=coords.device)
         neighbor_indices[neighbor_valid] = indices[neighbor_search_indices[neighbor_valid]]
         return SubMConv3dNeighborCache(**{'neighbor_map': neighbor_indices.reshape(L, -1).to(torch.uint32)})
         
@@ -144,7 +164,7 @@ class SubMConv3dFunction(Function):
             
             # im2col
             im2col = torch.zeros((N * V, Ci), device=feats.device, dtype=feats.dtype)
-            mask = neighbor_map.view(-1) != 0xffffffff
+            mask = neighbor_map.view(-1) != _sentinel(neighbor_map)
             im2col[mask] = feats[neighbor_map.view(-1).long()[mask]]
             im2col = im2col.view(N, V * Ci)
             
@@ -220,7 +240,7 @@ class SubMConv3dFunction(Function):
                     inv_neighbor_map = torch.flip(neighbor_map.to(torch.int32), [1]).to(torch.uint32)
                 else:
                     inv_neighbor_map = torch.flip(neighbor_map, [1])
-                mask = inv_neighbor_map.view(-1) != 0xffffffff
+                mask = inv_neighbor_map.view(-1) != _sentinel(inv_neighbor_map)
                 im2col[mask] = grad_output[inv_neighbor_map.view(-1).long()[mask]]
                 im2col = im2col.view(N, V * Co)
                 
@@ -232,7 +252,7 @@ class SubMConv3dFunction(Function):
             if weight.requires_grad:
                 # im2col
                 im2col = torch.zeros((N * V, Ci), device=weight.device, dtype=weight.dtype)
-                mask = neighbor_map.view(-1) != 0xffffffff
+                mask = neighbor_map.view(-1) != _sentinel(neighbor_map)
                 im2col[mask] = feats[neighbor_map.view(-1).long()[mask]]
                 im2col = im2col.view(N, V * Ci)
                 

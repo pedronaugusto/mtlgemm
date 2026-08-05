@@ -117,3 +117,37 @@ def test_mps_matches_cpu(dtype):
         f"CPU vs MPS divergence for {dtype}: max |diff|={diff.max().item():.3e} "
         f"(threshold {tol:.0e})"
     )
+
+
+@mps_required
+@pytest.mark.parametrize("algo", [
+    Algorithm.EXPLICIT_GEMM,
+    Algorithm.IMPLICIT_GEMM,
+    Algorithm.MASKED_IMPLICIT_GEMM,
+])
+def test_mps_all_algorithms_accept_mps_tensors(algo):
+    """Every algorithm must accept MPS tensors, not just IMPLICIT_GEMM.
+
+    EXPLICIT_GEMM used to raise on MPS:
+
+        RuntimeError: Promotion for uint16, uint32, uint64 types is not
+        supported, attempted to promote UInt32 and Long
+
+    from `neighbor_map.view(-1) != 0xffffffff` — the map is uint32 and the
+    literal is a Long, a promotion MPS refuses and CPU allows. Nothing caught
+    it because `conftest.get_device()` returns CPU on Darwin (the Metal
+    backend uses StorageModeShared buffers and dispatches internally), and
+    every test above pins IMPLICIT_GEMM. So the MPS-tensor path was only ever
+    covered for one of the three algorithms.
+    """
+    flex_gemm.ops.spconv.set_algorithm(algo)
+    torch.manual_seed(0)
+    Ci, Co, Ks = 32, 32, 3
+    feats, coords, shape = _sphere_coords(res=12, ch=Ci, device="mps", dtype=torch.float32)
+    weight = torch.randn(Co, Ks, Ks, Ks, Ci, dtype=torch.float32).to("mps")
+    bias = torch.randn(Co, dtype=torch.float32).to("mps")
+
+    out, _ = sparse_submanifold_conv3d(feats, coords, shape, weight, bias)
+
+    assert out.device.type == "mps", f"{algo}: expected MPS output, got {out.device}"
+    _ = out.sum().item()   # force a sync to surface deferred MPS errors
