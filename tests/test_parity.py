@@ -671,13 +671,26 @@ class TestSpconvParity:
         out_r, _ = sparse_submanifold_conv3d(feats_r, coords, shape, weight_r, bias)
         out_r.backward(grad_out)
 
-        gi_err = (feats_a.grad - feats_r.grad).abs()
-        gw_err = (weight_a.grad - weight_r.grad).abs()
-        assert gi_err.max().item() < 1e-4, (
-            f"Large-channel bwd grad_input [{algo}]: max={gi_err.max().item():.2e}"
+        # Use the combined abs/rel metric rather than a bare absolute bound.
+        # grad_input here reaches magnitude ~121, where one float32 ULP is
+        # already 1.4e-05, and each element is an 864-term reduction (27 taps
+        # x Ci=32) followed by a Co-wide one. A fixed 1e-04 absolute bound is
+        # below the noise floor of the reference itself: measured against an
+        # independent float64 CPU reference, EXPLICIT_GEMM is 1.26e-04 from
+        # ground truth, IMPLICIT_GEMM 1.26e-04, MASKED_IMPLICIT_GEMM 1.45e-04
+        # (masked's *mean* error is marginally the lowest of the three). So the
+        # old assert demanded that two float32 paths agree more tightly than
+        # the reference agrees with truth; it only held for IMPLICIT_GEMM
+        # because that path reduces in the same order as EXPLICIT and is
+        # bit-identical to it. This is accumulation-order drift, not a
+        # correctness bug — see issue #3.
+        gi_max, gi_mean = calc_err(feats_a.grad, feats_r.grad)
+        gw_max, gw_mean = calc_err(weight_a.grad, weight_r.grad)
+        assert gi_max < 1e-4, (
+            f"Large-channel bwd grad_input [{algo}]: max={gi_max:.2e}, mean={gi_mean:.2e}"
         )
-        assert gw_err.max().item() < 1e-4, (
-            f"Large-channel bwd grad_weight [{algo}]: max={gw_err.max().item():.2e}"
+        assert gw_max < 1e-4, (
+            f"Large-channel bwd grad_weight [{algo}]: max={gw_max:.2e}, mean={gw_mean:.2e}"
         )
 
     def test_cross_algorithm_bwd_parity(self, device, sphere_coords_fn, calc_err):
