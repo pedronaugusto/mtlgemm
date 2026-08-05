@@ -9,7 +9,8 @@ using namespace metal;
 // the SPCONV_FWD_KERNEL pattern in flex_gemm/kernels/metal/spconv/spconv_gemm.metal.
 //
 // Design:
-//   BLOCK_Q = 16, BLOCK_KV = 32, HEAD_DIM <= 64 (must be multiple of 8).
+//   BLOCK_Q = 16, BLOCK_KV = 32, HEAD_DIM a multiple of 8 (see MAX_HD below:
+//   <= 64 for fp32, <= 128 for fp16/bf16 — bounded by threadgroup memory).
 //   Threadgroup = 64 threads = 2 simdgroups. Simdgroup i owns Q rows [i*8, i*8+8).
 //   Grid: (cdiv(max_q_seqlen, BLOCK_Q), H, N).
 //
@@ -32,17 +33,31 @@ using namespace metal;
 //   smem_m [BLOCK_Q]          float
 //   smem_l [BLOCK_Q]          float
 //
-// For fp16 + head_dim=64: ~17KB. For fp32 + head_dim=64: ~28KB. Both fit
-// within 32KB threadgroup memory on Apple Silicon.
+// For fp16 + head_dim=64: ~17KB. For fp32 + head_dim=64: ~28KB. For fp16 +
+// head_dim=128: ~31.1KB. All fit within the 32KB threadgroup memory limit on
+// Apple Silicon; fp32 + head_dim=128 (~40KB for Q/K/V alone) does not, and the
+// dispatcher's smem computation in ext.mm rejects it.
 // ============================================================================
 
 #define BLOCK_Q 16
 #define BLOCK_KV 32
-#define MAX_HEAD_DIM 128
 #define TG_THREADS 64
 #define SENTINEL_NEG_INF -1.0e30f
 
-#define SPARSE_ATTN_FLASH_FWD_KERNEL(NAME, ELEM_T)                                          \
+// MAX_HD is a per-instantiation compile-time bound on head_dim, used only to
+// size the o_acc simdgroup-matrix register array. It is NOT a runtime limit:
+// the loops below are driven by C_v. Keep it as tight as each dtype can
+// actually reach, because the array costs registers whether or not the
+// runtime C_v uses all of it (C_v is not a compile-time constant, so the
+// compiler cannot elide the unused tail).
+//
+// Reachable head_dim per dtype is set by the 32KB threadgroup-memory budget
+// (see the smem sum in ext.mm). At head_dim=128:
+//   fp32       : Q+K+V alone = 8192+16384+16384 = 40960 B  -> cannot fit, ever
+//   fp16/bf16  : full sum    = 31872 B                     -> fits (896 B spare)
+// So fp32 tops out at 64 and must not pay for a 128-wide accumulator.
+
+#define SPARSE_ATTN_FLASH_FWD_KERNEL(NAME, ELEM_T, MAX_HD)                                  \
 kernel void NAME(                                                                           \
     const device ELEM_T* q                [[buffer(0)]],  /* [T_q, H, C_q] */              \
     const device ELEM_T* k                [[buffer(1)]],  /* [T_kv, H, C_q] */             \
@@ -218,7 +233,8 @@ kernel void NAME(                                                               
         /* O += P @ V via simdgroup matmul. Load o_acc from smem_o (post-rescale). */       \
         if (simd_id < (BLOCK_Q / 8)) {                                                      \
             uint n_tiles_cv = C_v / 8;                                                      \
-            simdgroup_matrix<float, 8, 8> o_acc[MAX_HEAD_DIM / 8];                          \
+            simdgroup_matrix<float, 8, 8> o_acc[MAX_HD / 8];                                \
+            /* MAX_HD is a compile-time bound; real extent is n_tiles_cv = C_v/8 */                          \
             for (uint tn = 0; tn < n_tiles_cv; tn++) {                                      \
                 simdgroup_load(o_acc[tn],                                                   \
                                smem_o + simd_id * 8 * C_v + tn * 8, C_v);                   \
@@ -255,6 +271,6 @@ kernel void NAME(                                                               
     }                                                                                       \
 }
 
-SPARSE_ATTN_FLASH_FWD_KERNEL(sparse_attention_tiled_fwd,        float)
-SPARSE_ATTN_FLASH_FWD_KERNEL(sparse_attention_tiled_fwd_half,   half)
-SPARSE_ATTN_FLASH_FWD_KERNEL(sparse_attention_tiled_fwd_bfloat, bfloat)
+SPARSE_ATTN_FLASH_FWD_KERNEL(sparse_attention_tiled_fwd,        float,   64)
+SPARSE_ATTN_FLASH_FWD_KERNEL(sparse_attention_tiled_fwd_half,   half,   128)
+SPARSE_ATTN_FLASH_FWD_KERNEL(sparse_attention_tiled_fwd_bfloat, bfloat, 128)

@@ -93,6 +93,11 @@ TOL = {
 @pytest.mark.parametrize("H,C_q,C_v", [
     (4, 32, 32),
     (8, 64, 64),
+    # head_dim=128 — the case the old fixed "C_q <= 64" flash gate silently
+    # routed into the naive fallback (~36x full-model regression). fp16/bf16
+    # now take flash here (~31.1KB smem, fits 32KB); fp32 needs ~40KB for
+    # Q/K/V alone so it still falls back to naive. Both must be correct.
+    (8, 128, 128),
 ])
 def test_sparse_attn_matches_sdpa(seqlens, H, C_q, C_v, dtype):
     torch.manual_seed(0x5AFE ^ sum(seqlens) ^ (H * 31) ^ (C_q * 17))

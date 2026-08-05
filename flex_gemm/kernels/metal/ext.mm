@@ -2073,7 +2073,11 @@ torch::Tensor sparse_attention_fwd(
     const uint32_t FLASH_BLOCK_Q  = 16;
     const uint32_t FLASH_BLOCK_KV = 32;
     const uint32_t FLASH_THREADS  = 64;
-    const uint32_t FLASH_SMEM_LIMIT = 32768;  // MTLDevice.maxThreadgroupMemoryLength, Apple Silicon
+    // Query the real limit rather than assuming 32768: it is 32KB on every
+    // Apple Silicon GPU shipped so far, but this is the authoritative value and
+    // costs one property read on a path that already builds a command buffer.
+    const uint32_t FLASH_SMEM_LIMIT =
+        (uint32_t)[ctx().device() maxThreadgroupMemoryLength];
     size_t elem_bytes = (q.scalar_type() == torch::kFloat32) ? 4 : 2;
     uint32_t shared_mem = (uint32_t)(
           FLASH_BLOCK_Q  * C_q * elem_bytes
@@ -2085,9 +2089,17 @@ torch::Tensor sparse_attention_fwd(
         + FLASH_BLOCK_Q  * 2 * sizeof(float)
     );
 
+    // Must match the MAX_HD each kernel in sparse_attn_tiled.metal is
+    // instantiated with — that macro sizes the o_acc register array, so
+    // dispatching a larger C_v than its instantiation would overrun it.
+    // fp32 is capped at 64 because fp32/head_dim=128 cannot fit smem anyway
+    // (~40KB for Q/K/V alone), so there is no reason to pay 128 registers.
+    const uint32_t FLASH_MAX_HD =
+        (q.scalar_type() == torch::kFloat32) ? 64u : 128u;
+
     const char* env_kernel = std::getenv("FLEX_GEMM_ATTN_KERNEL");
     bool flash_eligible =
-        (C_q == C_v) && (C_q % 8 == 0) && (C_q >= 8) && (C_q <= 128)
+        (C_q == C_v) && (C_q % 8 == 0) && (C_q >= 8) && (C_q <= FLASH_MAX_HD)
         && (shared_mem <= FLASH_SMEM_LIMIT);
     bool use_tiled;
     if (env_kernel && std::string(env_kernel) == "tiled") {
@@ -2249,6 +2261,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> sparse_attention_bwd(
     //     overran smem_p into smem_m/l/D at fp16/bf16 (smem_s+smem_p = 3KB at
     //     fp16 vs 4KB at fp32, while the spill is always 4KB).
     //   - FLEX_GEMM_ATTN_BWD_KERNEL={flash,naive} env override for A/B.
+    //   - NOTE: unlike the fwd gate, this stays at <= 64 deliberately. bwd_dq
+    //     carries Q, dO, K and V tiles plus a BLOCK_Q*C_q float dQ-spill
+    //     scratch, so at fp16/head_dim=128 it needs
+    //       (16*128*2)*2 + (32*128*2)*2 + 16*3*4 + max(3072, 16*128*4)
+    //       = 24768 + 8192 = 32960 B
+    //     which is 192 B OVER the 32768 B limit. head_dim=128 therefore cannot
+    //     use flash-bwd on any current Apple Silicon GPU and correctly falls
+    //     back to the naive bwd kernel (sparse_attn_bwd.metal, which is already
+    //     sized for BWD_MAX_HEAD_DIM=128). Forward still takes the flash path
+    //     at 128 — the asymmetry is real, not an oversight. Do not "fix" this
+    //     to match the fwd gate without re-deriving the smem sum above.
     const char* env_bwd = std::getenv("FLEX_GEMM_ATTN_BWD_KERNEL");
     bool flash_eligible =
         (C_q == C_v) && (C_q % 8 == 0) && (C_q <= 64) && (C_q >= 8);
