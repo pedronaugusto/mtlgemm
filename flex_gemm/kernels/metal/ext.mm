@@ -2054,13 +2054,41 @@ torch::Tensor sparse_attention_fwd(
     //       load bandwidth at BLOCK_KV=32.
     //
     // Gating:
-    //   - flash requires C_q == C_v, both multiples of 8, both <= 64
-    //     (smem budget: fp32/head_dim=64 uses ~28KB of the 32KB limit).
+    //   - flash requires C_q == C_v, both multiples of 8, both >= 8, and the
+    //     ACTUAL shared-memory footprint (dtype-aware) to fit within this
+    //     device's real 32KB threadgroup memory limit -- NOT a fixed head_dim
+    //     cutoff. The previous fixed "<= 64" cap was sized for fp32 only
+    //     (fp32/head_dim=64 uses ~28KB); at fp16/bf16, head_dim=128 needs
+    //     only ~31.1KB (still under the 32768-byte hardware limit, confirmed
+    //     via MTLDevice.maxThreadgroupMemoryLength on M5 Max), so the old
+    //     cutoff silently routed real half-precision workloads with
+    //     head_dim=128 (e.g. TRELLIS.2's shape/tex SLat flow models) into the
+    //     naive fallback -- a real, measured ~36x full-model regression on
+    //     Apple Silicon, not a hypothetical concern. sparse_attn_tiled.metal's
+    //     MAX_HEAD_DIM macro (the compile-time o_acc register array size) was
+    //     bumped from 64 to 128 to match; the runtime loop logic there was
+    //     already dtype/C_v-generic and needed no other change.
     //   - FLEX_GEMM_ATTN_KERNEL={naive,tiled} overrides the auto pick.
     //   - Default: flash whenever the gate is met, else naive.
+    const uint32_t FLASH_BLOCK_Q  = 16;
+    const uint32_t FLASH_BLOCK_KV = 32;
+    const uint32_t FLASH_THREADS  = 64;
+    const uint32_t FLASH_SMEM_LIMIT = 32768;  // MTLDevice.maxThreadgroupMemoryLength, Apple Silicon
+    size_t elem_bytes = (q.scalar_type() == torch::kFloat32) ? 4 : 2;
+    uint32_t shared_mem = (uint32_t)(
+          FLASH_BLOCK_Q  * C_q * elem_bytes
+        + FLASH_BLOCK_KV * C_q * elem_bytes
+        + FLASH_BLOCK_KV * C_v * elem_bytes
+        + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * sizeof(float)
+        + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * elem_bytes
+        + FLASH_BLOCK_Q  * C_v * sizeof(float)
+        + FLASH_BLOCK_Q  * 2 * sizeof(float)
+    );
+
     const char* env_kernel = std::getenv("FLEX_GEMM_ATTN_KERNEL");
     bool flash_eligible =
-        (C_q == C_v) && (C_q % 8 == 0) && (C_q <= 64) && (C_q >= 8);
+        (C_q == C_v) && (C_q % 8 == 0) && (C_q >= 8) && (C_q <= 128)
+        && (shared_mem <= FLASH_SMEM_LIMIT);
     bool use_tiled;
     if (env_kernel && std::string(env_kernel) == "tiled") {
         use_tiled = flash_eligible;
@@ -2081,20 +2109,6 @@ torch::Tensor sparse_attention_fwd(
         //   smem_o[16,  C_v]  float
         //   smem_m[16]        float
         //   smem_l[16]        float
-        const uint32_t FLASH_BLOCK_Q  = 16;
-        const uint32_t FLASH_BLOCK_KV = 32;
-        const uint32_t FLASH_THREADS  = 64;
-        size_t elem_bytes = (q.scalar_type() == torch::kFloat32) ? 4 : 2;
-        uint32_t shared_mem = (uint32_t)(
-              FLASH_BLOCK_Q  * C_q * elem_bytes
-            + FLASH_BLOCK_KV * C_q * elem_bytes
-            + FLASH_BLOCK_KV * C_v * elem_bytes
-            + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * sizeof(float)
-            + FLASH_BLOCK_Q  * FLASH_BLOCK_KV * elem_bytes
-            + FLASH_BLOCK_Q  * C_v * sizeof(float)
-            + FLASH_BLOCK_Q  * 2 * sizeof(float)
-        );
-
         std::string kernel_name = std::string("sparse_attention_tiled_fwd") + suffix;
 
         auto setup_tiled = [&](id<MTLComputeCommandEncoder> enc) {
