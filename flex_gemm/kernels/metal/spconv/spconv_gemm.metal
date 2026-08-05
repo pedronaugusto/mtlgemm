@@ -15,6 +15,16 @@ using namespace metal;
 // 256 threads = 8 SIMD groups, each owns one row of 8x8 sub-tiles
 // Threadgroup memory holds tiles in the *input* dtype (so half/bfloat halve it).
 // Accumulators are always float32 — only the loads/stores narrow.
+//
+// INDEX WIDTH: every global-buffer address below is computed in 32-bit `uint`
+// (`input[nb_idx * Ci + ci_idx]`, `output[n * Co + co]`, ...), so a buffer of
+// 2^32 or more elements would wrap and write to the wrong address. That ceiling
+// is deliberate: it is twice the signed-int32 limit upstream FlexGEMM had to fix
+// in its Triton kernels (c0a6ab0), there is no split-K variant here to multiply
+// the offset by a third term, and trellis2 inference peaks near 6e7 elements.
+// Widening to `ulong` would put 64-bit math in the cooperative-load loop below
+// to defend a margin nothing reaches, so the bound is enforced at dispatch
+// instead — see _assert_indexable in flex_gemm/kernels/metal/__init__.py.
 // ============================================================================
 
 #define B1 GEMM_BLOCK_N   // 64

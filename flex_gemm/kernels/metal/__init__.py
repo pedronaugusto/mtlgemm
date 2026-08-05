@@ -94,7 +94,37 @@ def indice_weighed_sum_bwd_input(grad_output, indices, weight, N):
 # ============================================================================
 import torch
 
+# The Metal GEMM kernels address every global buffer with 32-bit `uint` math
+# (`input[nb_idx * Ci + ci_idx]`, `output[n * Co + co]`, ...), so a buffer of
+# more than 2^32 elements wraps the index and silently writes to the wrong
+# address. Upstream FlexGEMM hit the *signed* form of this in the Triton
+# kernels and fixed it by promoting the row offset to int64 (c0a6ab0).
+#
+# The Metal port is not fixed the same way on purpose. Its arithmetic is
+# unsigned, so the ceiling is 2^32 rather than Triton's 2^31, and there is no
+# split-K variant here to multiply the offset by a third term. trellis2
+# inference peaks near 6e7 elements (the decoder pairs its 1024-channel stages
+# with a 32^3 grid and its 1e6-voxel stage with 64 channels), leaving ~67x of
+# headroom; even a pathological 1e6 x 1024 stage stays 4x clear. Promoting to
+# `ulong` would put 64-bit math in the cooperative-load loop to defend a margin
+# nothing reaches. Guard at dispatch instead — free at runtime, and it turns
+# silent corruption into a loud failure if a caller ever does get that big.
+_UINT32_INDEX_LIMIT = 2 ** 32
+
+
+def _assert_indexable(**tensors):
+    for name, t in tensors.items():
+        if t is not None and t.numel() >= _UINT32_INDEX_LIMIT:
+            raise RuntimeError(
+                f"metal spconv: '{name}' has {t.numel()} elements, which overflows the "
+                f"kernel's 32-bit index arithmetic (limit {_UINT32_INDEX_LIMIT}). "
+                f"Promote the buffer indexing in metal/spconv/spconv_gemm.metal to "
+                f"`ulong` to lift this."
+            )
+
+
 def sparse_submanifold_conv_fwd_implicit_gemm(input, weight, bias, neighbor_map):
+    _assert_indexable(input=input, weight=weight)
     return _C.spconv_fwd_implicit_gemm(
         input.contiguous(), weight.contiguous(),
         bias.contiguous() if bias is not None else torch.empty(0),
@@ -102,6 +132,7 @@ def sparse_submanifold_conv_fwd_implicit_gemm(input, weight, bias, neighbor_map)
     )
 
 def sparse_submanifold_conv_bwd_implicit_gemm(grad_output, input, weight, bias, neighbor_map):
+    _assert_indexable(grad_output=grad_output, input=input, weight=weight)
     grad_input, grad_weight = _C.spconv_bwd_implicit_gemm(
         grad_output.contiguous(), input.contiguous(),
         weight.contiguous(), neighbor_map.contiguous()
@@ -124,6 +155,7 @@ _MASKED_B1 = 64
 
 def sparse_submanifold_conv_fwd_masked_implicit_gemm(input, weight, bias, neighbor_map,
                                                       sorted_idx, valid_kernel_cb, valid_kernel_seg_cb):
+    _assert_indexable(input=input, weight=weight)
     valid_kernel = valid_kernel_cb(_MASKED_B1)
     valid_kernel_seg = valid_kernel_seg_cb(_MASKED_B1)
     return _C.spconv_fwd_masked_implicit_gemm(
@@ -138,6 +170,7 @@ def sparse_submanifold_conv_fwd_masked_implicit_gemm(input, weight, bias, neighb
 def sparse_submanifold_conv_bwd_masked_implicit_gemm(grad_output, input, weight, bias, neighbor_map,
                                                       sorted_idx, valid_kernel_cb, valid_kernel_seg_cb,
                                                       valid_signal_i, valid_signal_o, valid_signal_seg):
+    _assert_indexable(grad_output=grad_output, input=input, weight=weight)
     valid_kernel = valid_kernel_cb(_MASKED_B1)
     valid_kernel_seg = valid_kernel_seg_cb(_MASKED_B1)
     grad_input, grad_weight = _C.spconv_bwd_masked_implicit_gemm(
