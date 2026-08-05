@@ -2059,8 +2059,9 @@ torch::Tensor sparse_attention_fwd(
     //     device's real 32KB threadgroup memory limit -- NOT a fixed head_dim
     //     cutoff. The previous fixed "<= 64" cap was sized for fp32 only
     //     (fp32/head_dim=64 uses ~28KB); at fp16/bf16, head_dim=128 needs
-    //     only ~31.1KB (still under the 32768-byte hardware limit, confirmed
-    //     via MTLDevice.maxThreadgroupMemoryLength on M5 Max), so the old
+    //     only ~31.1KB (still under the 32768-byte hardware limit, which is
+    //     now read from MTLDevice.maxThreadgroupMemoryLength at dispatch time
+    //     rather than assumed for any particular part), so the old
     //     cutoff silently routed real half-precision workloads with
     //     head_dim=128 (e.g. TRELLIS.2's shape/tex SLat flow models) into the
     //     naive fallback -- a real, measured ~36x full-model regression on
