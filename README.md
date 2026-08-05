@@ -32,6 +32,14 @@ cd FlexGEMM
 pip install . --no-build-isolation
 ```
 
+> **Note:** `--no-build-isolation` is required, not optional. The `_C` extension
+> must be compiled against the exact torch installed in your environment. An
+> isolated build (plain `pip install .`) would compile against whatever torch
+> pip resolves into the temporary build env — an ABI mismatch that produces no
+> build-time error but fails at runtime with errors like
+> `tensor does not have a device`. The same applies after **upgrading torch**:
+> rebuild/reinstall this package with `--no-build-isolation`.
+
 ## 💻 Usage Example
 
 Here is a minimal example demonstrating how to perform a sparse submanifold convolution using FlexGEMM:

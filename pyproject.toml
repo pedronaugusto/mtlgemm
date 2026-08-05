@@ -1,8 +1,12 @@
 [build-system]
+# torch is deliberately NOT listed here: the extension must compile against the
+# torch already installed in the target environment (install with
+# --no-build-isolation). Listing it would let pip build _C against a freshly
+# resolved torch in an isolated env — ABI-mismatched with the venv's torch —
+# which fails only at runtime ("tensor does not have a device").
 requires = [
     "setuptools>=64",
     "wheel",
-    "torch",
 ]
 build-backend = "setuptools.build_meta"
 
