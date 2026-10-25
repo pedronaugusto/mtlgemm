@@ -22,6 +22,7 @@ It implements **Explicit**, **Implicit**, and **Masked Implicit** algorithm vari
 ## 🛠️ Installation
 
 ### Prerequisites
+* **macOS** ≥ 14 on Apple Silicon (Metal backend)
 * **PyTorch** ≥ 2.4.0
 * **Triton** ≥ 3.2.0
 
